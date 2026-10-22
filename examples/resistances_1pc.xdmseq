@@ -1,0 +1,9 @@
+# Contrôle d'une résistance 4,7 kΩ ±1 %
+PROMPT "Placez la résistance, puis OK"
+MODE RES
+RANGE AUTO
+WAIT_STABLE 0.1 5 15
+MEASURE r 5
+CHECK r 4.653k 4.747k
+LOG "R = {r}"
+SAY "Résistance {r}"

@@ -1,0 +1,15 @@
+# Exemple : contrôle d'une alimentation 5 V
+STOP_ON_FAIL OFF
+PROMPT "Pointes sur la sortie 5 V, puis OK"
+MODE VDC
+RANGE AUTO
+WAIT_STABLE 0.2 5 15
+MEASURE v5 10
+CHECK v5 4.75 5.25
+LOG "Tension continue : {v5}"
+MODE VAC
+WAIT 3
+MEASURE ondulation 10
+CHECK ondulation 0 50m
+LOG "Ondulation : {ondulation}"
+SAY "Test terminé"
