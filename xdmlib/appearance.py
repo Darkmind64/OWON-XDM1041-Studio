@@ -89,8 +89,9 @@ class AppearanceDialog(QtWidgets.QDialog):
         super().__init__(main)
         self.main = main
         self.setWindowTitle("Apparence")
-        self.resize(1280, 800)
-        self.setMinimumSize(1200, 680)
+        scr = QtGui.QGuiApplication.primaryScreen().availableGeometry() if QtGui.QGuiApplication.primaryScreen() else QtCore.QRect(0, 0, 1600, 900)
+        self.resize(min(1280, scr.width() - 40), min(800, scr.height() - 60))
+        self.setMinimumSize(720, 520)
         self.original = copy.deepcopy(theme_dict)
         self.t = copy.deepcopy(theme_dict)
         self.rows = []
@@ -101,7 +102,8 @@ class AppearanceDialog(QtWidgets.QDialog):
         root.setSpacing(0)
 
         nav = QtWidgets.QFrame(objectName="SidePanel")
-        nav.setFixedWidth(220)
+        nav.setFixedWidth(180)
+        self.navw = nav
         nl = QtWidgets.QVBoxLayout(nav)
         nl.setContentsMargins(12, 20, 12, 20)
         nl.setSpacing(4)
@@ -148,7 +150,8 @@ class AppearanceDialog(QtWidgets.QDialog):
         root.addWidget(center, 1)
 
         aside = QtWidgets.QFrame(objectName="SidePanel")
-        aside.setFixedWidth(390)
+        aside.setFixedWidth(360)
+        self.aside = aside
         al = QtWidgets.QVBoxLayout(aside)
         al.setContentsMargins(20, 22, 20, 20)
         al.setSpacing(14)
@@ -380,3 +383,8 @@ class AppearanceDialog(QtWidgets.QDialog):
             return
         self.sync_controls()
         self.timer.start()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if hasattr(self, "aside"):
+            self.aside.setVisible(self.width() >= 1080)

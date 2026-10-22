@@ -18,7 +18,7 @@ from xdmlib.sequence import SeqRunner, EXAMPLE, HELP
 from xdmlib.widgets import app_icon, FloatingDisplay
 from xdmlib import theme as TH
 from xdmlib.theme import mix
-from xdmlib.ui import (ActionButton, NavBar, Switch, SegmentBox, StatCard, DockTitle, PresetButton, FunctionPad,
+from xdmlib.ui import (FlowLayout, ActionButton, NavBar, Switch, SegmentBox, StatCard, DockTitle, PresetButton, FunctionPad,
                        RangeSelector, card, card_title, ui_font, mono)
 from xdmlib.display import DisplayWidget
 from xdmlib.appearance import AppearanceDialog
@@ -29,7 +29,7 @@ try:
 except ImportError:
     winsound = None
 
-VERSION = "3.0"
+VERSION = "3.1"
 MAXBUF = 300_000
 TRACE_COLORS = ["#4cff7a", "#ffb74c", "#7ad7ff", "#ff6fb5", "#c8a2ff", "#ffe066", "#ff5050", "#5cf2d6"]
 SECTIONS = [("mesure", "mesure", "Mesure"), ("analyse", "analyse", "Analyse"), ("tri", "tri", "Tri"),
@@ -63,30 +63,104 @@ def data_dir():
 
 
 class StatsPanel(QtWidgets.QWidget):
-    """Cartes de statistiques qui se réorganisent selon la largeur."""
+    """Cartes de statistiques sur une ligne ; les moins utiles se masquent quand la place manque."""
+    need_height = QtCore.Signal(int)
+    HIDE_ORDER = ["σ / moy", "Crête-crête", "N", "σ"]
+    CARD_W = 104
 
     def __init__(self, keys, parent=None):
         super().__init__(parent)
         self.setObjectName("Transparent")
-        self.grid = QtWidgets.QGridLayout(self)
-        self.grid.setContentsMargins(0, 0, 0, 0)
-        self.grid.setSpacing(10)
+        self.lay = QtWidgets.QHBoxLayout(self)
+        self.lay.setContentsMargins(0, 0, 0, 0)
+        self.lay.setSpacing(10)
         self.cards = {k: StatCard(k) for k in keys}
-        self.cols = 0
-        self._relayout(len(keys))
-
-    def _relayout(self, cols):
-        if cols == self.cols:
-            return
-        self.cols = cols
         for c in self.cards.values():
-            self.grid.removeWidget(c)
-        for i, c in enumerate(self.cards.values()):
-            self.grid.addWidget(c, i // cols, i % cols)
+            self.lay.addWidget(c, 1)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+
+    def minimumSizeHint(self):
+        h = max(c.height() for c in self.cards.values()) or 60
+        return QtCore.QSize(3 * self.CARD_W + 20, h)
+
+    def sizeHint(self):
+        return QtCore.QSize(len(self.cards) * (self.CARD_W + 30), self.minimumSizeHint().height())
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        self._relayout(max(1, min(len(self.cards), self.width() // 128)))
+        fit = max(3, (self.width() + 10) // (self.CARD_W + 10))
+        hide = set(self.HIDE_ORDER[:max(0, len(self.cards) - fit)])
+        for k, c in self.cards.items():
+            c.setVisible(k not in hide)
+
+
+class ElideLabel(QtWidgets.QLabel):
+    """Étiquette dont le texte est abrégé (…) selon la largeur disponible."""
+
+    def __init__(self, text="", **kw):
+        super().__init__(**kw)
+        self.full = ""
+        self.set_full(text)
+
+    def set_full(self, text):
+        self.full = text
+        self.pad = max(0, self.width() - self.contentsRect().width()) if self.width() > 0 else 30
+        self.setMaximumWidth(self.fontMetrics().horizontalAdvance(text) + self.pad + 12)
+        self._elide()
+
+    def _elide(self):
+        self.setText(self.fontMetrics().elidedText(self.full, Qt.ElideRight, max(30, self.contentsRect().width() - 4)))
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._elide()
+
+    def changeEvent(self, e):
+        super().changeEvent(e)
+        if e.type() in (QtCore.QEvent.FontChange, QtCore.QEvent.StyleChange):
+            QtCore.QTimer.singleShot(0, lambda: self.set_full(self.full))
+
+
+class ResponsiveGrid(QtWidgets.QWidget):
+    """Grille de cartes dont le nombre de colonnes suit la largeur."""
+
+    def __init__(self, col_w=380, maxcols=3):
+        super().__init__(objectName="Transparent")
+        self.col_w, self.maxcols, self.items, self.cols = col_w, maxcols, [], 0
+        self.grid = QtWidgets.QGridLayout(self)
+        self.grid.setContentsMargins(0, 0, 8, 0)
+        self.grid.setSpacing(14)
+        self.grid.setAlignment(Qt.AlignTop)
+
+    def add(self, w):
+        self.items.append(w)
+        self.cols = 0
+        self._relayout()
+
+    def _relayout(self):
+        cols = max(1, min(self.maxcols, self.width() // self.col_w)) if self.width() > 50 else self.maxcols
+        if cols == self.cols:
+            return
+        self.cols = cols
+        for w in self.items:
+            self.grid.removeWidget(w)
+        for i, w in enumerate(self.items):
+            self.grid.addWidget(w, i // cols, i % cols)
+        for c in range(self.maxcols):
+            self.grid.setColumnStretch(c, 1 if c < cols else 0)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._relayout()
+
+
+def scrolled(w, horizontal=False):
+    sa = QtWidgets.QScrollArea(widgetResizable=True)
+    sa.setFrameShape(QtWidgets.QFrame.NoFrame)
+    if not horizontal:
+        sa.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    sa.setWidget(w)
+    return sa
 
 
 class Main(QtWidgets.QMainWindow):
@@ -94,7 +168,9 @@ class Main(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle(f"{APP} {VERSION}")
         self.setWindowIcon(app_icon())
-        self.resize(1500, 960)
+        scr = QtGui.QGuiApplication.primaryScreen()
+        ag = scr.availableGeometry() if scr else QtCore.QRect(0, 0, 1600, 1000)
+        self.resize(min(1500, ag.width() - 20), min(960, ag.height() - 40))
         self.cfg = QtCore.QSettings("Davy", "XDM1041Studio")
         try:
             self.theme_t = TH.from_json(self.cfg.value("theme_json")) if self.cfg.value("theme_json") else TH.preset("Phosphore")
@@ -132,6 +208,7 @@ class Main(QtWidgets.QMainWindow):
         self.tts_last = 0.0
         self.first_connect = True
         self.ignore_until = 0.0
+        self.sync_gen, self.dev_auto, self.auto_fail = 0, None, 0
         self.persist = {}
         self.plots = []
         self.traces = []
@@ -169,6 +246,10 @@ class Main(QtWidgets.QMainWindow):
         self.goto("mesure")
         self.timer = QtCore.QTimer(self, interval=150, timeout=self.refresh_views)
         self.timer.start()
+        self.sync_timer = QtCore.QTimer(self, interval=2500, timeout=self.periodic_sync)
+        self.sync_timer.start()
+        self.disp.chip_clicked.connect(self.chip_menu)
+        self.ck_ah.toggled.connect(lambda _: self.update_mode_label())
         self.updater = Updater(self, VERSION)
         if self.act_autoupd.isChecked():
             QtCore.QTimer.singleShot(4000, self.updater.auto_check)
@@ -180,6 +261,7 @@ class Main(QtWidgets.QMainWindow):
 
     def _plot(self, **kw):
         p = pg.PlotWidget(**kw)
+        p.setMinimumSize(120, 70)
         p.showGrid(x=True, y=True, alpha=0.35)
         self.plots.append(p)
         return p
@@ -205,8 +287,11 @@ class Main(QtWidgets.QMainWindow):
         body.setSpacing(16)
         self.nav_rail = NavBar(SECTIONS, vertical=True)
         self.nav_rail.changed.connect(self.goto)
-        self.nav_rail.setFixedWidth(76)
-        body.addWidget(self.nav_rail)
+        self.rail_sa = scrolled(self.nav_rail)
+        self.rail_sa.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.rail_sa.setFixedWidth(76)
+        self.rail_sa.setMinimumHeight(120)
+        body.addWidget(self.rail_sa)
         self.stack = QtWidgets.QStackedWidget()
         body.addWidget(self.stack, 1)
         root.addLayout(body, 1)
@@ -228,23 +313,37 @@ class Main(QtWidgets.QMainWindow):
         lay.addWidget(self.logo)
         t = QtWidgets.QLabel("XDM1041 Studio", objectName="Title")
         t.setFont(ui_font(16, QtGui.QFont.Bold))
+        self.lb_title = t
         lay.addWidget(t)
-        lay.addSpacing(14)
-        self.lb_idn = QtWidgets.QLabel("Déconnecté", objectName="Pill")
-        lay.addWidget(self.lb_idn)
-        lay.addStretch()
-        self.cb_port = QtWidgets.QComboBox(minimumWidth=210)
-        self.cb_port.setMaximumWidth(280)
+        lay.addSpacing(6)
+        self.lb_idn = ElideLabel("Déconnecté", objectName="Pill")
+        self.lb_idn.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+        self.lb_idn.setMinimumWidth(90)
+        self.lb_idn.setMaximumHeight(34)
+        lay.addWidget(self.lb_idn, 4)
+        lay.addStretch(1)
+        self.cb_port = QtWidgets.QComboBox()
+        self.cb_port.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.cb_port.setMinimumContentsLength(6)
+        self.cb_port.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.cb_port.setMaximumWidth(300)
         self.bt_refresh = QtWidgets.QToolButton(clicked=self.refresh_ports, toolTip="Rafraîchir les ports")
-        self.bt_detect = QtWidgets.QPushButton("Détecter", clicked=self.detect_port)
-        self.bt_conn = QtWidgets.QPushButton("Connecter", clicked=self.toggle_connect, objectName="Primary", minimumWidth=110)
+        self.bt_detect = QtWidgets.QPushButton("Détecter", clicked=self.detect_port, toolTip="Rechercher le multimètre sur les ports COM")
+        self.bt_conn = QtWidgets.QPushButton("Connecter", clicked=self.toggle_connect, objectName="Primary", minimumWidth=104)
         for w in (self.cb_port, self.bt_refresh, self.bt_detect, self.bt_conn):
             lay.addWidget(w)
-        lay.addSpacing(12)
-        lay.addWidget(QtWidgets.QLabel("Profil", objectName="Muted"))
-        self.cb_profile = QtWidgets.QComboBox(minimumWidth=180)
+        lay.addSpacing(8)
+        self.lb_profile = QtWidgets.QLabel("Profil", objectName="Muted")
+        lay.addWidget(self.lb_profile)
+        self.cb_profile = QtWidgets.QComboBox(toolTip="Profil de mesure")
+        self.cb_profile.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.cb_profile.setMinimumContentsLength(6)
+        self.cb_profile.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.cb_profile.setMaximumWidth(230)
         self.cb_profile.activated.connect(lambda i: self.load_profile(self.cb_profile.itemText(i)) if i > 0 else None)
         lay.addWidget(self.cb_profile)
+        lay.setStretchFactor(self.cb_port, 2)
+        lay.setStretchFactor(self.cb_profile, 1)
         self.bt_layout = QtWidgets.QPushButton("Disposition", checkable=True, toolTip="Mode disposition : déplacer et redimensionner les panneaux")
         self.bt_layout.toggled.connect(self.set_edit_mode)
         self.bt_theme = QtWidgets.QToolButton(clicked=self.open_appearance, toolTip="Apparence")
@@ -348,6 +447,9 @@ class Main(QtWidgets.QMainWindow):
         bh.setWordWrap(True)
         for w in (self.banner_icon, bt):
             bl.addWidget(w)
+        bh.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+        self.banner.setToolTip(bh.text())
+        self.banner_hint = bh
         bl.addWidget(bh, 1)
         for txt, fn, name in (("Réinitialiser", lambda: self.apply_layout("Atelier"), "Ghost"), ("Annuler", self.cancel_edit, "Ghost"),
                               ("Enregistrer la disposition", self.save_edit, "Info")):
@@ -377,22 +479,26 @@ class Main(QtWidgets.QMainWindow):
             self.docks[key] = d
             self.dock_titles[key] = DockTitle(d, title)
             self.dock_titles[key].hide()
-        hb.addWidget(self.dockhost, 1)
-        hb.addWidget(self._side_panel())
+        self.dock_sa = scrolled(self.dockhost, horizontal=True)
+        hb.addWidget(self.dock_sa, 1)
+        self.side_sa = scrolled(self._side_panel())
+        self.side_sa.setFixedWidth(262)
+        self.side_sa.hide()
+        hb.addWidget(self.side_sa)
         v.addLayout(hb, 1)
         self.title_timer = QtCore.QTimer(self, interval=250, timeout=lambda: [t.update() for t in self.dock_titles.values()])
         return page
 
     def _w_display(self):
         self.disp = DisplayWidget()
-        self.disp.setMinimumHeight(150)
+        self.disp.setMinimumHeight(110)
         return self.disp
 
     def _w_actions(self):
         w = QtWidgets.QWidget(objectName="Transparent")
         h = QtWidgets.QHBoxLayout(w)
         h.setContentsMargins(0, 0, 0, 0)
-        h.setSpacing(10)
+        h.setSpacing(8)
         self.bt_hold = ActionButton("hold", "HOLD", "H")
         self.bt_hold.setCheckable(True)
         self.bt_hold.toggled.connect(lambda on: setattr(self, "hold", on))
@@ -424,8 +530,6 @@ class Main(QtWidgets.QMainWindow):
     def _w_stats(self):
         self.statsp = StatsPanel(["N", "Min", "Max", "Moyenne", "σ", "Crête-crête", "σ / moy"])
         self.st = {k: c.val for k, c in self.statsp.cards.items()}
-        self.statsp.setMinimumHeight(64)
-        self.statsp.setMaximumHeight(240)
         return self.statsp
 
     def _w_function(self):
@@ -455,7 +559,7 @@ class Main(QtWidgets.QMainWindow):
         sa = QtWidgets.QScrollArea(widgetResizable=True)
         sa.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         sa.setWidget(f)
-        sa.setMinimumWidth(260)
+        self.func_sa = sa
         return sa
 
     def _w_limits(self):
@@ -485,9 +589,9 @@ class Main(QtWidgets.QMainWindow):
             g.addLayout(box, i // 2, i % 2)
         v.addLayout(g)
         row = QtWidgets.QHBoxLayout()
-        bt = QtWidgets.QPushButton("Nominal ± % → limites", clicked=self.nom_to_limits)
+        bt = QtWidgets.QPushButton("± % → limites", clicked=self.nom_to_limits, toolTip="Calcule Mini/Maxi à partir du nominal et de la tolérance")
         row.addWidget(bt)
-        row.addWidget(QtWidgets.QPushButton("RAZ compteurs", clicked=self.reset_pf))
+        row.addWidget(QtWidgets.QPushButton("RAZ", clicked=self.reset_pf, toolTip="Remise à zéro des compteurs PASS / FAIL"))
         v.addLayout(row)
         self.ck_limbeep = self.R("lim_beep", QtWidgets.QCheckBox("Bip sur FAIL", checked=True))
         v.addWidget(self.ck_limbeep)
@@ -500,16 +604,17 @@ class Main(QtWidgets.QMainWindow):
         v.addLayout(bot)
         v.addStretch()
         self.st_pf = pf
-        return f
+        sa = scrolled(f)
+        self.lim_sa = sa
+        return sa
 
     def _w_chart(self):
         f, v = card(None, margins=(14, 12, 14, 12), spacing=8)
-        top = QtWidgets.QHBoxLayout()
-        top.setSpacing(10)
+        topw = QtWidgets.QWidget(objectName="Transparent")
+        top = FlowLayout(topw, 8)
         self.chart_seg = SegmentBox(["Graphique", "Histogramme"])
         self.chart_seg.set_current(0)
         top.addWidget(self.chart_seg)
-        top.addStretch()
         self.ck_chartpause = QtWidgets.QCheckBox("Figer")
         self.ck_mean = QtWidgets.QCheckBox("Moyenne")
         self.ck_region = QtWidgets.QCheckBox("Région d'analyse")
@@ -525,7 +630,7 @@ class Main(QtWidgets.QMainWindow):
         self.win_seg.picked.connect(self.cb_win.setCurrentIndex)
         top.addWidget(self.win_seg)
         top.addWidget(QtWidgets.QPushButton("Auto-échelle", clicked=self.autoscale))
-        v.addLayout(top)
+        v.addWidget(topw)
         self.chart_stack = QtWidgets.QStackedWidget()
         self.chart_seg.picked.connect(self.chart_stack.setCurrentIndex)
         p0 = QtWidgets.QWidget(objectName="Transparent")
@@ -569,7 +674,7 @@ class Main(QtWidgets.QMainWindow):
 
     def _side_panel(self):
         self.side = QtWidgets.QFrame(objectName="SidePanel")
-        self.side.setFixedWidth(300)
+        self.side.setMinimumWidth(240)
         v = QtWidgets.QVBoxLayout(self.side)
         v.setContentsMargins(16, 16, 16, 16)
         v.setSpacing(10)
@@ -588,14 +693,13 @@ class Main(QtWidgets.QMainWindow):
         self.preset_grid.setSpacing(10)
         v.addWidget(self.preset_box)
         row = QtWidgets.QHBoxLayout()
-        row.addWidget(QtWidgets.QPushButton("Enregistrer sous…", clicked=self.save_layout_as))
+        row.addWidget(QtWidgets.QPushButton("Enregistrer…", clicked=self.save_layout_as, toolTip="Enregistrer la disposition actuelle sous un nom"))
         row.addWidget(QtWidgets.QPushButton("Supprimer…", clicked=self.delete_layout))
         v.addLayout(row)
         v.addStretch()
         hint = QtWidgets.QLabel("Astuce : un panneau détaché devient une fenêtre indépendante, utile sur un second écran.", objectName="Muted")
         hint.setWordWrap(True)
         v.addWidget(hint)
-        self.side.hide()
         self._refresh_presets()
         return self.side
 
@@ -609,7 +713,9 @@ class Main(QtWidgets.QMainWindow):
 
     def _col(self, width=340):
         w = QtWidgets.QWidget(objectName="Transparent")
-        w.setFixedWidth(width)
+        w.setMinimumWidth(250)
+        w.setMaximumWidth(width)
+        w.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
         v = QtWidgets.QVBoxLayout(w)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(14)
@@ -692,7 +798,8 @@ class Main(QtWidgets.QMainWindow):
         v.addLayout(row)
         h.addWidget(f, 1)
         f, v = card("Bacs")
-        f.setFixedWidth(260)
+        f.setMinimumWidth(170)
+        f.setMaximumWidth(260)
         self.tbl_bins = QtWidgets.QTableWidget(0, 2)
         self.tbl_bins.setHorizontalHeaderLabels(["Bac", "Nombre"])
         self.tbl_bins.horizontalHeader().setStretchLastSection(True)
@@ -773,9 +880,10 @@ class Main(QtWidgets.QMainWindow):
     def _page_seq(self):
         p, h = self._page()
         f, v = card(None)
-        hb = QtWidgets.QHBoxLayout()
+        top = QtWidgets.QHBoxLayout()
+        hbw = QtWidgets.QWidget(objectName="Transparent")
+        hb = FlowLayout(hbw, 8)
         hb.addWidget(card_title("Séquence de test"))
-        hb.addSpacing(10)
         self.bt_seqrun = QtWidgets.QPushButton("Exécuter", clicked=self.seq_run, objectName="Primary")
         self.bt_seqstop = QtWidgets.QPushButton("Arrêter", clicked=lambda: self.seq.stop())
         for x in (self.bt_seqrun, self.bt_seqstop, QtWidgets.QPushButton("Ouvrir…", clicked=self.seq_load),
@@ -783,11 +891,11 @@ class Main(QtWidgets.QMainWindow):
                   QtWidgets.QPushButton("Exemple", clicked=lambda: self.ed_seq.setPlainText(EXAMPLE)),
                   QtWidgets.QPushButton("Aide", clicked=lambda: QtWidgets.QMessageBox.information(self, "Séquences", HELP))):
             hb.addWidget(x)
-        hb.addStretch()
+        top.addWidget(hbw, 1)
         self.lb_verdict = QtWidgets.QLabel("")
         self.lb_verdict.setFont(ui_font(18, QtGui.QFont.Bold))
-        hb.addWidget(self.lb_verdict)
-        v.addLayout(hb)
+        top.addWidget(self.lb_verdict, 0, Qt.AlignTop)
+        v.addLayout(top)
         sp = QtWidgets.QSplitter()
         self.ed_seq = QtWidgets.QPlainTextEdit()
         self.ed_seq.setFont(mono(13))
@@ -835,20 +943,16 @@ class Main(QtWidgets.QMainWindow):
         fl = QtWidgets.QFormLayout()
         fl.setVerticalSpacing(10)
         fl.setHorizontalSpacing(14)
+        fl.setRowWrapPolicy(QtWidgets.QFormLayout.WrapLongRows)
+        fl.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
         v.addLayout(fl)
         v.addStretch()
-        grid.addWidget(f, *pos)
+        grid.add(f)
         return fl
 
     def _page_reglages(self):
-        sa = QtWidgets.QScrollArea(widgetResizable=True)
-        inner = QtWidgets.QWidget(objectName="Transparent")
-        g = QtWidgets.QGridLayout(inner)
-        g.setContentsMargins(0, 0, 8, 0)
-        g.setSpacing(14)
-        for c in range(3):
-            g.setColumnStretch(c, 1)
-        sa.setWidget(inner)
+        g = ResponsiveGrid(360, 3)
+        sa = scrolled(g)
 
         fl = self._group(g, "Acquisition & affichage", (0, 0))
         self.sp_int = self.R("interval", QtWidgets.QSpinBox(suffix=" ms", maximum=3_600_000, singleStep=100))
@@ -957,7 +1061,16 @@ class Main(QtWidgets.QMainWindow):
         fl.addRow(self.ck_mqtt)
         fl.addRow(QtWidgets.QPushButton("Configurer MQTT…", clicked=self.mqtt_dialog))
         fl.addRow(self.lb_mqtt)
-        g.setRowStretch(3, 1)
+
+        fl = self._group(g, "Sons", (2, 1))
+        self.ck_snd = self.R("snd_en", Switch("Sons activés"))
+        self.ck_snd.setChecked(True)
+        self.ck_snd_cap = self.R("snd_cap", QtWidgets.QCheckBox("Bip à chaque capture"))
+        self.ck_snd_end = self.R("snd_end", QtWidgets.QCheckBox("Bip fin de séquence / décharge / déclenchement", checked=True))
+        for w in (self.ck_snd, self.ck_snd_cap, self.ck_snd_end):
+            fl.addRow(w)
+        hint = QtWidgets.QLabel("Bip sur FAIL : panneau Limites. Bips d'anomalie : « Surveillance ».", objectName="Muted", wordWrap=True)
+        fl.addRow(hint)
         return sa
 
     def _shortcuts(self):
@@ -990,7 +1103,7 @@ class Main(QtWidgets.QMainWindow):
         app = QtWidgets.QApplication.instance()
         TH.apply(app, t)
         skin, nav = t["skin"], t["nav"]
-        self.nav_rail.setVisible(nav == "rail")
+        self.rail_sa.setVisible(nav == "rail")
         self.tabsrow.setVisible(nav == "tabs")
         self.disp.apply_theme(skin)
         self.fpad.set_skin(skin)
@@ -1000,9 +1113,11 @@ class Main(QtWidgets.QMainWindow):
         self.func_card.style().polish(self.func_card)
         for c in self.statsp.cards.values():
             c.refont()
+        QtCore.QTimer.singleShot(0, self._fit_side_docks)
         self.logo.setPixmap(TH.svg_pixmap(TH.ICONS["logo"], t["accent"], 26, stroke=2.2))
         self.banner_icon.setPixmap(TH.svg_pixmap(TH.ICONS["layout"], t["sec"], 20))
         self.bt_refresh.setIcon(TH.icon("refresh", t["text"], 16))
+        self.bt_detect.setIcon(TH.icon("plug", t["text"], 16))
         self.bt_theme.setIcon(TH.icon("palette", t["text"], 18))
         self.bt_menu.setIcon(TH.icon("menu", t["text"], 18))
         self.bt_layout.setIcon(TH.icon("layout", t["accent"] if self.edit_mode else t["text"], 16))
@@ -1018,6 +1133,11 @@ class Main(QtWidgets.QMainWindow):
         self.set_zoom(int(self.cfg.value("zoom", 100)), save=False)
         if save:
             self.cfg.setValue("theme_json", TH.to_json(t))
+
+    def _fit_side_docks(self):
+        sb = self.style().pixelMetric(QtWidgets.QStyle.PM_ScrollBarExtent) + 4
+        for sa in (self.func_sa, self.lim_sa):
+            sa.setMinimumWidth(sa.widget().minimumSizeHint().width() + sb)
 
     def _theme_plots(self):
         t = self.theme_t
@@ -1082,7 +1202,9 @@ class Main(QtWidgets.QMainWindow):
             w.style().polish(w)
             self._sync_dock_check(key)
         self.banner.setVisible(on)
-        self.side.setVisible(on)
+        if self.theme_t["nav"] == "rail" and not self.act_compact.isChecked():
+            self.rail_sa.setVisible(not on)
+        self.side_sa.setVisible(on)
         self.bt_layout.blockSignals(True)
         self.bt_layout.setChecked(on)
         self.bt_layout.blockSignals(False)
@@ -1192,13 +1314,13 @@ class Main(QtWidgets.QMainWindow):
         if self.act_compact.isChecked():
             self.compact_state = self.dockhost.saveState(LAYOUT_VERSION)
             self.apply_layout("Compact")
-            self.nav_rail.hide()
+            self.rail_sa.hide()
             self.tabsrow.hide()
             self.goto("mesure")
         else:
             if self.compact_state is not None:
                 self.dockhost.restoreState(self.compact_state, LAYOUT_VERSION)
-            self.nav_rail.setVisible(self.theme_t["nav"] == "rail")
+            self.rail_sa.setVisible(self.theme_t["nav"] == "rail")
             self.tabsrow.setVisible(self.theme_t["nav"] == "tabs")
 
     # ================================================================== réglages / profils
@@ -1388,11 +1510,22 @@ class Main(QtWidgets.QMainWindow):
             self.statusBar().showMessage(f"XDM1041 trouvé sur {self.cb_port.itemData(found)}", 5000)
 
     def _pill(self, text, state=None):
-        self.lb_idn.setText(text)
+        self.lb_idn.set_full(text)
+        self.lb_idn.setToolTip(self.idn if state == "on" else "")
         for prop in ("on", "lost"):
             self.lb_idn.setProperty(prop, state == prop)
         self.lb_idn.style().unpolish(self.lb_idn)
         self.lb_idn.style().polish(self.lb_idn)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        w = self.width()
+        compact = w < 1500
+        self.lb_title.setVisible(w >= 1150)
+        self.banner_hint.setVisible(w >= 1350)
+        self.lb_profile.setVisible(not compact)
+        self.bt_detect.setText("" if compact else "Détecter")
+        self.bt_layout.setText("" if compact else "Disposition")
 
     def toggle_connect(self):
         if self.worker:
@@ -1493,6 +1626,11 @@ class Main(QtWidgets.QMainWindow):
 
     def on_reply(self, tag, r):
         r0 = r.strip().strip('"').upper()
+        if tag.startswith("psync_"):
+            kind, gen = tag[6:].split("|")
+            if int(gen) == self.sync_gen and time.time() >= self.ignore_until:
+                self.on_psync(kind, r0)
+            return
         if tag == "sync_func" and r0 in FUNC_MAP:
             self.set_mode(FUNC_MAP[r0], send=False)
         elif tag == "sync_rate" and r0[:1] in ("S", "L", "M", "F"):
@@ -1560,6 +1698,8 @@ class Main(QtWidgets.QMainWindow):
         if not m.get("dual") and self.worker:
             self.worker.dual = False
         if send:
+            self.sync_gen += 1
+            self.dev_auto = None
             self.ignore_until = time.time() + 0.6
             if key == "TEMP":
                 self.cmd(f"{m['cmd']} {m['ranges'][max(0, self.cb_range.currentIndex())][1]}")
@@ -1600,18 +1740,101 @@ class Main(QtWidgets.QMainWindow):
         return bool(self.unit_override) or MODES[self.mode].get("noprefix", False)
 
     def mode_chips(self):
-        chips = [MODES[self.mode]["label"]]
+        chips = [("func", MODES[self.mode]["label"], "Fonction — cliquer pour changer")]
         if self.cb_range.count():
-            chips.append(self.cb_range.currentText())
-        chips.append(self.cb_speed.currentText().split(" (")[0])
+            rg = self.cb_range.currentText()
+            if self.cb_range.currentIndex() == 0 and self.mode != "TEMP" and self.dev_auto is False:
+                rg = "Manuel"
+            chips.append(("range", rg, "Gamme — cliquer pour changer"))
+        chips.append(("speed", self.cb_speed.currentText().split(" (")[0], "Vitesse de mesure — cliquer pour changer"))
         if self.sp_avg.value() > 1:
-            chips.append(f"AVG {self.sp_avg.value()}")
+            chips.append(("avg", f"Moy. ×{self.sp_avg.value()}", "Moyenne glissante — cliquer pour changer"))
         if self.cb_math.currentIndex():
-            chips.append(self.cb_math.currentText().split(" (")[0])
+            chips.append(("math", self.cb_math.currentText().split(" (")[0], "Fonction maths de l'appareil"))
+        if self.ck_ah.isChecked():
+            chips.append(("capt", "Capture auto", "Capture automatique active (page Tri) — cliquer pour la désactiver"))
         return chips
 
     def mode_text(self):
-        return "   ".join(self.mode_chips())
+        return "   ".join(c[1] for c in self.mode_chips())
+
+    def chip_menu(self, key, pos):
+        m = QtWidgets.QMenu(self)
+
+        def add(text, fn, checked=None):
+            a = m.addAction(text, fn)
+            if checked is not None:
+                a.setCheckable(True)
+                a.setChecked(checked)
+
+        if key == "func":
+            for k, md in MODES.items():
+                add(md["label"], lambda k=k: self.set_mode(k), k == self.mode)
+        elif key == "range":
+            for i in range(self.cb_range.count()):
+                add(self.cb_range.itemText(i), lambda i=i: self.on_range_pick(i), i == self.cb_range.currentIndex())
+        elif key == "speed":
+            for i in range(self.cb_speed.count()):
+                add(self.cb_speed.itemText(i), lambda i=i: self.on_speed_pick(i), i == self.cb_speed.currentIndex())
+        elif key == "avg":
+            for n in (1, 2, 5, 10, 20, 50, 100):
+                add("Désactivée" if n == 1 else f"{n} mesures", lambda n=n: self.sp_avg.setValue(n), n == self.sp_avg.value())
+        elif key == "math":
+            add("Réglages maths…", lambda: self.goto("reglages"))
+            add("Désactiver", lambda: (self.cb_math.setCurrentIndex(0), self.apply_math()))
+        elif key == "capt":
+            add("Désactiver la capture automatique", lambda: self.ck_ah.setChecked(False))
+            add("Réglages de capture…", lambda: self.goto("tri"))
+        if not m.isEmpty():
+            m.exec(pos)
+
+    # ------------------------------------------------------------ synchronisation périodique avec la face avant
+    def periodic_sync(self):
+        if not self.worker or self.bt_run.isChecked() or self.seq_running() or time.time() < self.ignore_until:
+            return
+        g = self.sync_gen
+        self.cmd("FUNC?", f"psync_func|{g}")
+        self.cmd("RATE?", f"psync_rate|{g}")
+        if MODES[self.mode]["ranges"] and self.mode != "TEMP" and self.auto_fail < 2:
+            self.cmd("AUTO?", f"psync_auto|{g}")
+        if MODES[self.mode].get("dual"):
+            self.cmd("FUNC2?", f"psync_func2|{g}")
+
+    def seq_running(self):
+        r = getattr(self.seq, "running", False)
+        return r() if callable(r) else bool(r)
+
+    def on_psync(self, kind, r0):
+        if kind == "func":
+            if r0 in FUNC_MAP and FUNC_MAP[r0] != self.mode:
+                self.set_mode(FUNC_MAP[r0], send=False)
+                self.add_event("Appareil", None, f"fonction changée en face avant : {MODES[self.mode]['label']}")
+        elif kind == "rate":
+            i = {"S": 0, "L": 0, "M": 1, "F": 2}.get(r0[:1])
+            if i is not None and i != self.cb_speed.currentIndex():
+                self.cb_speed.setCurrentIndex(i)
+                self.update_mode_label()
+        elif kind == "auto":
+            if r0 not in ("0", "1"):
+                self.auto_fail += 1
+                return
+            self.auto_fail = 0
+            auto = r0 == "1"
+            if auto and self.cb_range.currentIndex() > 0:
+                self.cb_range.setCurrentIndex(0)
+            if auto != self.dev_auto:
+                self.dev_auto = auto
+                self.update_mode_label()
+        elif kind == "func2":
+            dual = r0.startswith("FREQ")
+            if dual != self.ck_dual.isChecked():
+                self.ck_dual.blockSignals(True)
+                self.ck_dual.setChecked(dual)
+                self.ck_dual.blockSignals(False)
+                if self.worker:
+                    self.worker.dual = dual
+                if not dual:
+                    self.disp.set_secondary("")
 
     def update_mode_label(self):
         self.disp.set_chips(self.mode_chips())
@@ -1630,6 +1853,8 @@ class Main(QtWidgets.QMainWindow):
         if not m["ranges"]:
             return
         val = m["ranges"][idx][1]
+        self.sync_gen += 1
+        self.dev_auto = None if idx == 0 else False
         if self.mode == "TEMP":
             self.cmd(f"{m['cmd']} {val}")
             self.cmd(f"TEMP:RTD:UNIT {self.cb_tunit.currentText()}")
@@ -1643,12 +1868,14 @@ class Main(QtWidgets.QMainWindow):
 
     def set_speed(self, idx):
         self.want_rate, self.rate_retry = idx, False
+        self.sync_gen += 1
         letter = self.slow_letter if idx == 0 else "SMF"[idx]
         self.cmd(f"RATE {letter}")
         self.cmd("RATE?", "rate_chk")
         self.update_mode_label()
 
     def set_dual(self, on):
+        self.sync_gen += 1
         self.cmd('FUNC2 "FREQ"' if on else 'FUNC2 "NONe"')
         if self.worker:
             self.worker.dual = on
@@ -1708,7 +1935,15 @@ class Main(QtWidgets.QMainWindow):
         return super().eventFilter(obj, ev)
 
     # ================================================================== fonctions locales
-    def beep(self, kind="fail"):
+    def beep(self, kind="fail", cause="end"):
+        if not self.ck_snd.isChecked():
+            return
+        if cause == "cap" and not self.ck_snd_cap.isChecked():
+            return
+        if cause == "fail" and not self.ck_limbeep.isChecked():
+            return
+        if cause == "end" and not self.ck_snd_end.isChecked():
+            return
         if winsound:
             winsound.MessageBeep(winsound.MB_ICONHAND if kind == "fail" else winsound.MB_OK)
         else:
@@ -1808,7 +2043,7 @@ class Main(QtWidgets.QMainWindow):
                 it.setForeground(QtGui.QColor(self.theme_t["fail"] if bad else self.theme_t["pass_"]))
             self.tbl.setItem(r, c, it)
         self.tbl.scrollToBottom()
-        self.beep("fail" if bad else "ok")
+        self.beep("fail", "fail") if bad else self.beep("ok", "cap")
         self.statusBar().showMessage(f"Capture n° {r + 1} : {self.fmt(v)} {bac}", 3000)
         tts = self.cb_tts.currentIndex()
         if tts in (2, 4):
@@ -1882,7 +2117,7 @@ class Main(QtWidgets.QMainWindow):
         for kind, msg in self.anom.feed(t, v, cfg):
             self.add_event(kind, v, msg)
             if self.ck_an_beep.isChecked():
-                self.beep("fail")
+                self.beep("fail", "anom")
                 if self.cb_tts.currentIndex() in (3, 4):
                     self.speaker.say(f"Alerte {kind}")
 
@@ -1916,8 +2151,7 @@ class Main(QtWidgets.QMainWindow):
         pf = self.eval_limits(v)
         if pf:
             if pf == "FAIL" and self.pf != "FAIL":
-                if self.ck_limbeep.isChecked():
-                    self.beep("fail")
+                self.beep("fail", "fail")
                 if self.cb_tts.currentIndex() in (3, 4):
                     self.speaker.say("Hors limites, " + speak_si(v, self.unit(), 4, self.noprefix()))
             if pf != self.pf:
@@ -2158,13 +2392,13 @@ class Main(QtWidgets.QMainWindow):
             for k, val in (("N", f"{S.n:,}".replace(",", " ")), ("Min", f(S.min)), ("Max", f(S.max)), ("Moyenne", f(S.mean)),
                            ("σ", f(S.std)), ("Crête-crête", f(S.max - S.min)),
                            ("σ / moy", f"{100 * S.std / abs(S.mean):.4f} %" if S.mean else "—")):
-                self.st[k].setText(val)
+                self.statsp.cards[k].set(val)
             if self.theme_t["skin"] == "instrument":
                 g = lambda x: fmt_si(x, u, 6, npf)
                 self.disp.set_statsline(f"MIN {g(S.min)}    MOY {g(S.mean)}    MAX {g(S.max)}    σ {fmt_si(S.std, u, 3, npf)}")
         else:
             for k in self.st:
-                self.st[k].setText("—")
+                self.statsp.cards[k].set("—")
             self.disp.set_statsline("")
         self.st_pf.setText(f"PASS {self.npass} · FAIL {self.nfail}")
         extra = []

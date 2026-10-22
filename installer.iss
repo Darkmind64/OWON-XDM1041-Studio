@@ -1,5 +1,5 @@
 #define AppName "OWON XDM1041 Studio"
-#define AppVer "3.0"
+#define AppVer "3.1"
 [Setup]
 AppId={{6B2E6F3A-1D41-4E5B-9C3A-5D1041A7C0DE}
 AppName={#AppName}

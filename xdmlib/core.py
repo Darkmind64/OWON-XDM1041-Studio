@@ -5,7 +5,7 @@ import serial
 from PySide6 import QtCore
 
 APP = "OWON XDM1041 Studio"
-VERSION = "3.0"
+VERSION = "3.1"
 OL_LIMIT = 9.9e8
 
 MODES = {

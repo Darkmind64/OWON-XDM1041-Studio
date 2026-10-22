@@ -179,8 +179,10 @@ QLabel#Pill[on="true"] { background: $pill_bg; color: $pill_fg; border-color: $p
 QLabel#Pill[lost="true"] { background: $warn_bg; color: $warn; border-color: $warn; }
 QFrame#Display { background: $disp_bg; border: 1px solid $disp_border; border-radius: 16px; }
 QFrame#Display[skin="instrument"] { border: 3px solid $disp_border; border-radius: 12px; }
-QLabel#DispChip { background: $chip_bg; color: $chip_fg; border-radius: 6px; padding: 3px 9px; }
+QLabel#DispChip { background: $chip_bg; color: $chip_fg; border-radius: 6px; padding: 2px 8px; border: 1px solid transparent; }
+QLabel#DispChip:hover { border: 1px solid $digit; }
 QLabel#DispChip[accent="true"] { background: $btn_on; color: $digit; font-weight: 600; }
+QLabel#DispChip[warn="true"] { background: $warn_bg; color: $warn; font-weight: 600; }
 QLabel#PF { border-radius: 8px; padding: 4px 14px; font-weight: 700; }
 QLabel#PF[pf="PASS"] { background: $pass_; color: $pass_text; }
 QLabel#PF[pf="FAIL"] { background: $fail; color: $fail_text; }

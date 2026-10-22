@@ -217,7 +217,7 @@ class SeqRunner(QtCore.QObject):
             elif c == "SAY":
                 self.ui.speaker.say(self._fmt(rest.strip('"')))
             elif c == "BEEP":
-                self.ui.beep("ok")
+                self.ui.beep("ok", "seq")
             elif c == "STOP_ON_FAIL":
                 self.fail_stop = a[0].upper() in ("ON", "1", "OUI")
             else:

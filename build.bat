@@ -13,7 +13,7 @@ set ISCC=
 for %%P in ("%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe" "%ProgramFiles%\Inno Setup 6\ISCC.exe" "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe") do if exist %%P set ISCC=%%P
 if defined ISCC (
   %ISCC% /Q installer.iss || goto :err
-  echo Installateur : installer\XDM1041_Studio_Setup_3.0.exe
+  echo Installateur : installer\XDM1041_Studio_Setup_3.1.exe
 ) else (
   echo Inno Setup absent : installateur non genere ^(winget install JRSoftware.InnoSetup^)
 )

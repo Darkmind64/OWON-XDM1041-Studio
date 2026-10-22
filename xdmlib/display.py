@@ -6,10 +6,25 @@ from . import theme as TH
 from .theme import mix
 from .ui import BarGraph, mono, ui_font, T
 
+class Chip(QtWidgets.QLabel):
+    clicked = QtCore.Signal(str, QtCore.QPoint)
+
+    def __init__(self):
+        super().__init__(objectName="DispChip")
+        self.key = ""
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.clicked.emit(self.key, self.mapToGlobal(QtCore.QPoint(0, self.height() + 2)))
+
+
 ANNUN = ["AUTO", "HOLD", "REL", "AVG", "MATH", "dB", "2ND", "REC", "RMT"]
 
 
 class DisplayWidget(QtWidgets.QFrame):
+    chip_clicked = QtCore.Signal(str, QtCore.QPoint)
+
     def __init__(self, parent=None, preview=False):
         super().__init__(parent)
         self.setObjectName("Display")
@@ -27,7 +42,7 @@ class DisplayWidget(QtWidgets.QFrame):
         self.chip_box.setSpacing(8)
         self.chips = []
         self.annun_box = QtWidgets.QHBoxLayout()
-        self.annun_box.setSpacing(16)
+        self.annun_box.setSpacing(12)
         self.annun = {}
         for a in ANNUN:
             lab = QtWidgets.QLabel(a)
@@ -100,10 +115,9 @@ class DisplayWidget(QtWidgets.QFrame):
             lab.setFont(mono(14))
         self.rate.setFont(mono(12))
         self.rate.setStyleSheet(f"color: {t.get('muted')};")
-        self.bar_w.setVisible(inst or bool(t.get("bargraph")))
+        self._auto_hide()
         self.scale.setFont(mono(16))
         self.scale.setStyleSheet(f"color: {mix(t.get('digit', '#888'), t.get('disp_bg', '#000'), 0.45)};")
-        self.statsline.setVisible(inst)
         self.statsline.setFont(mono(16))
         self.statsline.setStyleSheet(f"color: {mix(t.get('digit', '#888'), t.get('disp_bg', '#000'), 0.45)};")
         self.sec.setFont(mono(20))
@@ -120,9 +134,12 @@ class DisplayWidget(QtWidgets.QFrame):
         self._refresh_annun()
 
     def _refresh_annun(self):
+        inst = self.skin == "instrument"
+        narrow = self.width() < 640
         for a, lab in self.annun.items():
             on = lab.property("on")
             lab.setStyleSheet(f"color: {T('digit') if on else T('annun_off')};")
+            lab.setVisible(inst and (bool(on) or not narrow))
 
     # ---------------------------------------------------------------- données
     def set_value(self, num, unit, color=None):
@@ -152,17 +169,35 @@ class DisplayWidget(QtWidgets.QFrame):
         if self.preview:
             want = int(want * 0.6)
         avail_w = max(60, self.width() - 60)
-        avail_h = max(30, self.height() - (150 if self.skin == "instrument" else 110))
+        fixed = 28 + 26 + (34 if (self.pf.isVisible() or self.sec.text() or self.extra.text()) else 4)
+        if self.bar_w.isVisible():
+            fixed += 30
+        if self.statsline.isVisible():
+            fixed += 28
+        avail_h = max(24, self.height() - fixed)
         n = max(5, len(self.num))
         fm = QtGui.QFontMetricsF(mono(100, True))
         w100 = fm.horizontalAdvance("8" * n) + 0.4 * fm.horizontalAdvance("8" * max(2, len(self.unit_txt))) + 14
         fit_w = avail_w / w100 * 100
-        fit_h = avail_h / 0.95
+        fit_h = avail_h * 100 / (fm.height() * 0.92)
         return max(18, min(want, fit_w, fit_h))
+
+    def _auto_hide(self):
+        inst = self.skin == "instrument"
+        h = self.height()
+        bar = inst or bool(TH.CURRENT.get("bargraph"))
+        self.statsline.setVisible(inst and h >= 200)
+        self.bar_w.setVisible(bar and h >= (150 if inst else 170))
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
+        self._auto_hide()
         self._paint_value()
+        if (e.size().width() < 640) != (e.oldSize().width() < 640):
+            self._refresh_annun()
+
+    def minimumSizeHint(self):
+        return QtCore.QSize(240, 110)
 
     def _blink(self):
         if self.num == "OL" and TH.CURRENT.get("blink_ol"):
@@ -172,15 +207,21 @@ class DisplayWidget(QtWidgets.QFrame):
             self.blink_on = True
             self._paint_value()
 
-    def set_chips(self, items):
+    def set_chips(self, items, tips=None):
+        """items : liste de textes ou de (clé, texte, info-bulle)."""
         while len(self.chips) < len(items):
-            c = QtWidgets.QLabel(objectName="DispChip")
+            c = Chip()
+            c.clicked.connect(self.chip_clicked.emit)
             self.chip_box.addWidget(c)
             self.chips.append(c)
         for i, c in enumerate(self.chips):
             if i < len(items):
-                c.setText(items[i])
+                it = items[i] if isinstance(items[i], (tuple, list)) else ("", items[i], "")
+                c.key = it[0]
+                c.setText(it[1])
+                c.setToolTip(it[2] if len(it) > 2 else "")
                 c.setProperty("accent", i == 0)
+                c.setProperty("warn", c.key == "capt")
                 c.style().unpolish(c)
                 c.style().polish(c)
                 c.setVisible(self.skin != "instrument")

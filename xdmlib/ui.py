@@ -117,6 +117,7 @@ class TileButton(PaintButton):
         self.setCheckable(True)
         self.setToolTip(label)
         self.setMinimumHeight(58 if style == "tile" else 62)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
 
     def sizeHint(self):
         return QtCore.QSize(80, 58 if self.kind == "tile" else 62)
@@ -161,14 +162,23 @@ class ActionButton(PaintButton):
         self.icon_name, self.key, self.variant = icon_name, key, variant
         self.setText(text)
         self.setFixedHeight(44)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+
+    def setText(self, t):
+        super().setText(t)
+        self.setToolTip(t + (f"  ({self.key})" if getattr(self, "key", "") else "") if t else self.toolTip())
+        self.updateGeometry()
+
+    def _widths(self):
+        fm = QtGui.QFontMetrics(ui_font(14, QtGui.QFont.Medium))
+        tw = 10 + fm.horizontalAdvance(self.text()) if self.text() else 0
+        return 30 + 18 + tw + (34 if self.key else 0), 30 + 18 + tw
 
     def sizeHint(self):
-        fm = QtGui.QFontMetrics(ui_font(14, QtGui.QFont.Medium))
-        w = 16 + 18 + (10 + fm.horizontalAdvance(self.text()) if self.text() else 0) + (34 if self.key else 0) + 16
-        return QtCore.QSize(max(44, w), 44)
+        return QtCore.QSize(max(44, self._widths()[0]), 44)
 
     def minimumSizeHint(self):
-        return self.sizeHint()
+        return QtCore.QSize(44, 44)
 
     def paintEvent(self, e):
         p = QtGui.QPainter(self)
@@ -188,7 +198,10 @@ class ActionButton(PaintButton):
         if self.isDown():
             bg = mix(bg, T("text"), 0.08)
         rrect(p, r, 12, bg, bd, 1)
-        x = 14 if (self.text() or self.key) else (r.width() - 18) // 2
+        full, nokey = self._widths()
+        show_key = self.key and r.width() >= full
+        show_txt = self.text() and r.width() >= nokey
+        x = 14 if (show_txt or show_key) else (r.width() - 18) // 2
         if self.variant == "danger" and self.icon_name == "rec":
             p.setBrush(qc(fg if on else f))
             p.setPen(Qt.NoPen)
@@ -196,13 +209,13 @@ class ActionButton(PaintButton):
         else:
             p.drawPixmap(x, (r.height() - 18) // 2, svg_pixmap(ICONS.get(self.icon_name, self.icon_name), fg, 18))
         x += 18 + 10
-        if self.text():
+        if show_txt:
             p.setPen(qc(fg))
             p.setFont(ui_font(14, QtGui.QFont.DemiBold if self.variant == "danger" else QtGui.QFont.Medium))
             fm = p.fontMetrics()
             p.drawText(QtCore.QRect(x, 0, fm.horizontalAdvance(self.text()) + 2, r.height()), Qt.AlignVCenter, self.text())
             x += fm.horizontalAdvance(self.text()) + 10
-        if self.key:
+        if show_key:
             kr = QtCore.QRect(x, (r.height() - 20) // 2, 24, 20)
             rrect(p, kr, 5, mix(T("bg"), "#000000", 0.2), T("border"), 1)
             p.setPen(qc(T("muted")))
@@ -359,14 +372,37 @@ class StatCard(QtWidgets.QFrame):
         f = ui_font(11, QtGui.QFont.DemiBold)
         f.setLetterSpacing(QtGui.QFont.AbsoluteSpacing, 0.8)
         k.setFont(f)
+        k.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
         self.val = QtWidgets.QLabel("—")
         self.val.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.val.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
         lay.addWidget(k)
         lay.addWidget(self.val)
         self.refont()
 
     def refont(self):
+        self._sz = None
         self.val.setFont(mono(16))
+        self.setFixedHeight(self.sizeHint().height())
+        self.fit()
+
+    def set(self, txt):
+        if txt != self.val.text():
+            self.val.setText(txt)
+            self.fit()
+
+    def fit(self):
+        tw = QtGui.QFontMetricsF(mono(16)).horizontalAdvance(self.val.text())
+        avail = self.width() - 30
+        sz = 16 if tw <= avail or tw <= 0 else max(9, int(16 * avail / tw))
+        if sz != getattr(self, "_sz", None):
+            self._sz = sz
+            self.val.setFont(mono(sz))
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.fit()
 
 
 class DockTitle(QtWidgets.QWidget):
@@ -410,6 +446,10 @@ class PresetButton(PaintButton):
         self.name, self.cells = name, cells
         self.setCheckable(True)
         self.setFixedHeight(88)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+
+    def minimumSizeHint(self):
+        return QtCore.QSize(90, 88)
 
     def sizeHint(self):
         return QtCore.QSize(120, 88)
