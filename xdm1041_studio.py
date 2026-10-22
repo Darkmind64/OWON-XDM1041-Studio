@@ -10,20 +10,40 @@ from PySide6.QtCore import Qt
 import pyqtgraph as pg
 import pyqtgraph.exporters
 
-from xdmlib.core import (APP, VERSION, MODES, FUNC_MAP, DB_REFS, fmt_si, speak_si, parse_si, try_si, Stats, DmmWorker)
+from xdmlib.core import (APP, MODES, FUNC_MAP, DB_REFS, fmt_si, fmt_parts, auto_full_scale, speak_si, try_si, Stats, DmmWorker)
 from xdmlib.analysis import SERIES, nearest_e, auto_threshold, consumption, AnomalyDetector, Battery
 from xdmlib.services import WebServer, MqttPublisher, Speaker
 from xdmlib.reports import build_pdf, table_html, export_xlsx
 from xdmlib.sequence import SeqRunner, EXAMPLE, HELP
-from xdmlib.widgets import THEMES, app_icon, apply_theme, FloatingDisplay
+from xdmlib.widgets import app_icon, FloatingDisplay
+from xdmlib import theme as TH
+from xdmlib.theme import mix
+from xdmlib.ui import (ActionButton, NavBar, Switch, SegmentBox, StatCard, DockTitle, PresetButton, FunctionPad,
+                       RangeSelector, card, card_title, ui_font, mono)
+from xdmlib.display import DisplayWidget
+from xdmlib.appearance import AppearanceDialog
+from xdmlib.updater import Updater
 
 try:
     import winsound
 except ImportError:
     winsound = None
 
+VERSION = "3.0"
 MAXBUF = 300_000
 TRACE_COLORS = ["#4cff7a", "#ffb74c", "#7ad7ff", "#ff6fb5", "#c8a2ff", "#ffe066", "#ff5050", "#5cf2d6"]
+SECTIONS = [("mesure", "mesure", "Mesure"), ("analyse", "analyse", "Analyse"), ("tri", "tri", "Tri"),
+            ("batt", "batterie", "Batterie"), ("conso", "conso", "Conso"), ("seq", "sequences", "Séquences"),
+            ("journal", "journal", "Journal"), ("reglages", "reglages", "Réglages")]
+DOCKS = [("display", "Afficheur"), ("actions", "Actions"), ("stats", "Statistiques"), ("function", "Fonction · Gamme"),
+         ("limits", "Limites"), ("chart", "Graphique")]
+LAYOUTS = {
+    "Atelier": [(0, 0, .27, .64, 0), (0, .68, .27, .32, 0), (.30, 0, .70, .34, 1), (.30, .38, .70, .10, 0), (.30, .52, .70, .12, 0), (.30, .68, .70, .32, 0)],
+    "Grand afficheur": [(0, 0, 1, .55, 1), (0, .59, 1, .10, 0), (0, .73, 1, .27, 0)],
+    "Analyse": [(0, 0, .45, .30, 1), (.48, 0, .52, .30, 0), (0, .34, 1, .66, 0)],
+    "Compact": [(0, 0, 1, .78, 1), (0, .82, 1, .18, 0)],
+}
+LAYOUT_VERSION = 3
 DEFAULT_PROFILES = {
     "Tri résistances 1 %": dict(mode="RES", range=0, speed=1, ah_en=True, ah_n=5, ah_tol=0.2, ah_min="0.1",
                                 bin_en=True, bin_series=2, bin_tol=1.0, lim_en=False, avg=1, interval=0),
@@ -42,15 +62,46 @@ def data_dir():
     return p
 
 
+class StatsPanel(QtWidgets.QWidget):
+    """Cartes de statistiques qui se réorganisent selon la largeur."""
+
+    def __init__(self, keys, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Transparent")
+        self.grid = QtWidgets.QGridLayout(self)
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        self.grid.setSpacing(10)
+        self.cards = {k: StatCard(k) for k in keys}
+        self.cols = 0
+        self._relayout(len(keys))
+
+    def _relayout(self, cols):
+        if cols == self.cols:
+            return
+        self.cols = cols
+        for c in self.cards.values():
+            self.grid.removeWidget(c)
+        for i, c in enumerate(self.cards.values()):
+            self.grid.addWidget(c, i // cols, i % cols)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._relayout(max(1, min(len(self.cards), self.width() // 128)))
+
+
 class Main(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"{APP} {VERSION}")
         self.setWindowIcon(app_icon())
-        self.resize(1500, 950)
+        self.resize(1500, 960)
         self.cfg = QtCore.QSettings("Davy", "XDM1041Studio")
-        self.theme = self.cfg.value("theme", "dark")
-        self.colors = apply_theme(QtWidgets.QApplication.instance(), self.theme)
+        try:
+            self.theme_t = TH.from_json(self.cfg.value("theme_json")) if self.cfg.value("theme_json") else TH.preset("Phosphore")
+        except (ValueError, TypeError):
+            self.theme_t = TH.preset("Phosphore")
+        TH.apply(QtWidgets.QApplication.instance(), self.theme_t)
+        pg.setConfigOptions(antialias=True, background=self.theme_t["plot"], foreground=self.theme_t["muted"])
         self.worker = None
         self.mode = "VDC"
         self.unit_override = None
@@ -60,6 +111,7 @@ class Main(QtWidgets.QMainWindow):
         self.last_t = 0.0
         self.idn = ""
         self.disp_text = "-----"
+        self.disp_color = None
         self.tbuf, self.ybuf = deque(maxlen=MAXBUF), deque(maxlen=MAXBUF)
         self.view_t = self.view_y = np.array([])
         self.stats = Stats()
@@ -83,13 +135,17 @@ class Main(QtWidgets.QMainWindow):
         self.persist = {}
         self.plots = []
         self.traces = []
+        self.section = "mesure"
+        self.edit_mode = False
+        self.compact_state = None
+        self.n_events = 0
         self.web = WebServer()
         self.mqtt = MqttPublisher()
-        self.mqtt.status.connect(lambda s: self.lb_mqtt.setText(s))
         self.speaker = Speaker()
         self.floating = None
         self.seq = SeqRunner(self)
         self._build()
+        self.mqtt.status.connect(lambda s: self.lb_mqtt.setText(s))
         self.seq.log.connect(self.seq_out.appendPlainText)
         self.seq.done.connect(self.seq_done)
         self._shortcuts()
@@ -105,97 +161,144 @@ class Main(QtWidgets.QMainWindow):
                 self.set_mode("VDC", send=False)
         else:
             self.set_mode("VDC", send=False)
+        self.apply_layout("Atelier")
+        ls = self.cfg.value("layout_state")
+        if ls:
+            self.dockhost.restoreState(QtCore.QByteArray.fromBase64(ls.encode()), LAYOUT_VERSION)
+        self.apply_theme(self.theme_t, save=False)
+        self.goto("mesure")
         self.timer = QtCore.QTimer(self, interval=150, timeout=self.refresh_views)
         self.timer.start()
+        self.updater = Updater(self, VERSION)
+        if self.act_autoupd.isChecked():
+            QtCore.QTimer.singleShot(4000, self.updater.auto_check)
 
     # ================================================================== construction UI
     def R(self, name, w):
         self.persist[name] = w
         return w
 
-    def _group(self, lv, title):
-        g = QtWidgets.QGroupBox(title)
-        lv.addWidget(g)
-        return QtWidgets.QFormLayout(g)
-
     def _plot(self, **kw):
         p = pg.PlotWidget(**kw)
-        p.showGrid(x=True, y=True, alpha=0.3)
+        p.showGrid(x=True, y=True, alpha=0.35)
         self.plots.append(p)
         return p
 
     def _build(self):
         self._menus()
-        central = QtWidgets.QWidget()
+        central = QtWidgets.QWidget(objectName="Root")
         self.setCentralWidget(central)
         root = QtWidgets.QVBoxLayout(central)
-        top = QtWidgets.QHBoxLayout()
-        self.cb_port = QtWidgets.QComboBox(minimumWidth=280)
-        self.bt_refresh = QtWidgets.QPushButton("↻", clicked=self.refresh_ports, maximumWidth=34)
-        self.bt_detect = QtWidgets.QPushButton("Détecter", clicked=self.detect_port)
-        self.bt_conn = QtWidgets.QPushButton("Connecter", clicked=self.toggle_connect, minimumWidth=110)
-        self.lb_idn = QtWidgets.QLabel("Déconnecté")
-        self.lb_rate = QtWidgets.QLabel("")
-        self.cb_profile = QtWidgets.QComboBox(minimumWidth=180)
-        self.cb_profile.activated.connect(lambda i: self.load_profile(self.cb_profile.itemText(i)) if i > 0 else None)
-        for w in (QtWidgets.QLabel("Port :"), self.cb_port, self.bt_refresh, self.bt_detect, self.bt_conn, self.lb_idn):
-            top.addWidget(w)
-        top.addStretch()
-        top.addWidget(QtWidgets.QLabel("Profil :"))
-        top.addWidget(self.cb_profile)
-        top.addWidget(self.lb_rate)
-        root.addLayout(top)
-
-        split = QtWidgets.QSplitter(Qt.Horizontal)
-        root.addWidget(split, 1)
-        self.left = QtWidgets.QScrollArea(widgetResizable=True, minimumWidth=400, maximumWidth=480)
-        self.left.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        lw = QtWidgets.QWidget()
-        lv = QtWidgets.QVBoxLayout(lw)
-        self.left.setWidget(lw)
-        split.addWidget(self.left)
-        self._build_left(lv)
-
-        right = QtWidgets.QWidget()
-        rv = QtWidgets.QVBoxLayout(right)
-        rv.setContentsMargins(0, 0, 0, 0)
-        split.addWidget(right)
-        split.setStretchFactor(1, 1)
-        self._build_display(rv)
-        self.tabs = QtWidgets.QTabWidget()
-        rv.addWidget(self.tabs, 1)
-        self._tab_chart()
-        self._tab_hist()
-        self._tab_captures()
-        self._tab_events()
-        self._tab_battery()
-        self._tab_conso()
-        self._tab_compare()
-        self._tab_seq()
-        self._tab_console()
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(self._header())
+        self.tabsrow = QtWidgets.QFrame(objectName="TabsRow")
+        tr = QtWidgets.QHBoxLayout(self.tabsrow)
+        tr.setContentsMargins(14, 6, 14, 6)
+        self.nav_tabs = NavBar(SECTIONS, vertical=False)
+        self.nav_tabs.changed.connect(self.goto)
+        tr.addWidget(self.nav_tabs)
+        tr.addStretch()
+        root.addWidget(self.tabsrow)
+        body = QtWidgets.QHBoxLayout()
+        body.setContentsMargins(16, 16, 16, 12)
+        body.setSpacing(16)
+        self.nav_rail = NavBar(SECTIONS, vertical=True)
+        self.nav_rail.changed.connect(self.goto)
+        self.nav_rail.setFixedWidth(76)
+        body.addWidget(self.nav_rail)
+        self.stack = QtWidgets.QStackedWidget()
+        body.addWidget(self.stack, 1)
+        root.addLayout(body, 1)
+        self.pages = {}
+        for key, builder in (("mesure", self._page_mesure), ("analyse", self._page_analyse), ("tri", self._page_tri),
+                             ("batt", self._page_batt), ("conso", self._page_conso), ("seq", self._page_seq),
+                             ("journal", self._page_journal), ("reglages", self._page_reglages)):
+            w = builder()
+            self.pages[key] = self.stack.addWidget(w)
         self.statusBar().showMessage("Prêt")
 
+    def _header(self):
+        h = QtWidgets.QFrame(objectName="Header")
+        h.setFixedHeight(60)
+        lay = QtWidgets.QHBoxLayout(h)
+        lay.setContentsMargins(18, 0, 14, 0)
+        lay.setSpacing(10)
+        self.logo = QtWidgets.QLabel()
+        lay.addWidget(self.logo)
+        t = QtWidgets.QLabel("XDM1041 Studio", objectName="Title")
+        t.setFont(ui_font(16, QtGui.QFont.Bold))
+        lay.addWidget(t)
+        lay.addSpacing(14)
+        self.lb_idn = QtWidgets.QLabel("Déconnecté", objectName="Pill")
+        lay.addWidget(self.lb_idn)
+        lay.addStretch()
+        self.cb_port = QtWidgets.QComboBox(minimumWidth=210)
+        self.cb_port.setMaximumWidth(280)
+        self.bt_refresh = QtWidgets.QToolButton(clicked=self.refresh_ports, toolTip="Rafraîchir les ports")
+        self.bt_detect = QtWidgets.QPushButton("Détecter", clicked=self.detect_port)
+        self.bt_conn = QtWidgets.QPushButton("Connecter", clicked=self.toggle_connect, objectName="Primary", minimumWidth=110)
+        for w in (self.cb_port, self.bt_refresh, self.bt_detect, self.bt_conn):
+            lay.addWidget(w)
+        lay.addSpacing(12)
+        lay.addWidget(QtWidgets.QLabel("Profil", objectName="Muted"))
+        self.cb_profile = QtWidgets.QComboBox(minimumWidth=180)
+        self.cb_profile.activated.connect(lambda i: self.load_profile(self.cb_profile.itemText(i)) if i > 0 else None)
+        lay.addWidget(self.cb_profile)
+        self.bt_layout = QtWidgets.QPushButton("Disposition", checkable=True, toolTip="Mode disposition : déplacer et redimensionner les panneaux")
+        self.bt_layout.toggled.connect(self.set_edit_mode)
+        self.bt_theme = QtWidgets.QToolButton(clicked=self.open_appearance, toolTip="Apparence")
+        self.bt_menu = QtWidgets.QToolButton(toolTip="Menu")
+        self.bt_menu.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        self.bt_menu.setMenu(self.main_menu)
+        for w in (self.bt_layout, self.bt_theme, self.bt_menu):
+            lay.addWidget(w)
+        return h
+
     def _menus(self):
-        mb = self.menuBar()
-        mf = mb.addMenu("&Fichier")
+        self.main_menu = QtWidgets.QMenu(self)
+        mf = self.main_menu.addMenu("Fichier")
         self.menu_prof = mf.addMenu("Profils")
         mf.addSeparator()
-        mf.addAction("Exporter les données (CSV)…", self.export_buffer, "Ctrl+E")
-        mf.addAction("Exporter vers Excel (.xlsx)…", self.export_excel, "Ctrl+Shift+E")
-        mf.addAction("Exporter le graphique (PNG)…", self.export_png)
-        mf.addAction("Rapport d'intervention (PDF)…", self.report_pdf, "Ctrl+P")
+        for txt, fn, sc in (("Exporter les données (CSV)…", self.export_buffer, "Ctrl+E"),
+                            ("Exporter vers Excel (.xlsx)…", self.export_excel, "Ctrl+Shift+E"),
+                            ("Exporter le graphique (PNG)…", self.export_png, None),
+                            ("Rapport d'intervention (PDF)…", self.report_pdf, "Ctrl+P")):
+            a = mf.addAction(txt, fn)
+            if sc:
+                a.setShortcut(sc)
+                self.addAction(a)
         mf.addSeparator()
-        mf.addAction("Quitter", self.close, "Ctrl+Q")
-        mv = mb.addMenu("&Affichage")
+        a = mf.addAction("Quitter", self.close)
+        a.setShortcut("Ctrl+Q")
+        self.addAction(a)
+        mv = self.main_menu.addMenu("Affichage")
+        mv.addAction("Apparence…", self.open_appearance)
+        ms = mv.addMenu("Style")
+        self.skin_group = QtGui.QActionGroup(self)
+        for k, lab in (("atelier", "A — Atelier (moderne)"), ("instrument", "B — Instrument (face avant)")):
+            a = ms.addAction(lab, lambda k=k: self.set_option("skin", k))
+            a.setCheckable(True)
+            a.setData(k)
+            self.skin_group.addAction(a)
+        mn = mv.addMenu("Navigation")
+        self.nav_group = QtGui.QActionGroup(self)
+        for k, lab in (("rail", "Barre latérale"), ("tabs", "Onglets en haut")):
+            a = mn.addAction(lab, lambda k=k: self.set_option("nav", k))
+            a.setCheckable(True)
+            a.setData(k)
+            self.nav_group.addAction(a)
+        ml = mv.addMenu("Disposition")
+        self.menu_layouts = ml
+        mv.addSeparator()
         self.act_top = mv.addAction("Toujours au premier plan", self.toggle_top)
         self.act_top.setCheckable(True)
         self.act_compact = mv.addAction("Mode compact", self.toggle_compact)
         self.act_compact.setCheckable(True)
-        self.act_float = mv.addAction("Afficheur flottant", self.toggle_floating, "F11")
+        self.act_float = mv.addAction("Afficheur flottant", self.toggle_floating)
         self.act_float.setCheckable(True)
-        mv.addSeparator()
-        self.act_light = mv.addAction("Thème clair", self.toggle_theme)
-        self.act_light.setCheckable(True)
+        self.act_float.setShortcut("F11")
+        self.addAction(self.act_float)
         mz = mv.addMenu("Taille du texte")
         self.zoom_group = QtGui.QActionGroup(self)
         for pct in (100, 115, 130, 150, 175):
@@ -203,7 +306,7 @@ class Main(QtWidgets.QMainWindow):
             a.setCheckable(True)
             a.setData(pct)
             self.zoom_group.addAction(a)
-        mo = mb.addMenu("&Options")
+        mo = self.main_menu.addMenu("Options")
         self.act_autorec = mo.addAction("Reconnexion automatique")
         self.act_fast = mo.addAction("Vitesse rapide à la connexion")
         self.act_restore = mo.addAction("Appliquer le dernier mode à la connexion")
@@ -211,104 +314,345 @@ class Main(QtWidgets.QMainWindow):
         for a in (self.act_autorec, self.act_fast, self.act_restore, self.act_rangecmd):
             a.setCheckable(True)
             a.setChecked(True)
+        self.act_autoupd = mo.addAction("Vérifier les mises à jour au démarrage")
+        self.act_autoupd.setCheckable(True)
+        self.act_autoupd.setChecked(True)
         mo.addSeparator()
         mo.addAction("Configuration MQTT…", self.mqtt_dialog)
-        mh = mb.addMenu("&Aide")
+        mh = self.main_menu.addMenu("Aide")
         mh.addAction("Raccourcis clavier", lambda: QtWidgets.QMessageBox.information(self, "Raccourcis", (
             "H  HOLD\nR  REL Δ\nEspace  capture\nP  pause / reprise acquisition\nC  copier la valeur\n"
             "A  auto-échelle du graphique\nF11  afficheur flottant\nCtrl+E  export CSV\nCtrl+Shift+E  export Excel\n"
-            "Ctrl+P  rapport PDF\nCtrl+Q  quitter")))
+            "Ctrl+P  rapport PDF\nCtrl+Q  quitter\n\nMode disposition : glisser un panneau par sa poignée ⋮⋮,\n"
+            "tirer les séparations pour redimensionner, double-clic sur un titre pour détacher.")))
         mh.addAction("Langage des séquences", lambda: QtWidgets.QMessageBox.information(self, "Séquences", HELP))
+        mh.addAction("Rechercher des mises à jour…", lambda: self.updater.check(silent=False))
         mh.addAction("À propos", lambda: QtWidgets.QMessageBox.about(
             self, APP, f"{APP} {VERSION}\nSCPI OWON XDM1041 — USB COM 115200 8N1\nPython / PySide6 / pyqtgraph"))
 
-    def _build_left(self, lv):
-        g = QtWidgets.QGroupBox("Fonction")
-        gl = QtWidgets.QGridLayout(g)
-        self.fbtn = QtWidgets.QButtonGroup(self)
-        for i, (k, m) in enumerate(MODES.items()):
-            b = QtWidgets.QPushButton(m["label"], checkable=True, minimumWidth=60)
-            b.clicked.connect(lambda _=False, key=k: self.set_mode(key))
-            b.setProperty("key", k)
-            self.fbtn.addButton(b)
-            gl.addWidget(b, i // 4, i % 4)
-        lv.addWidget(g)
+    # ------------------------------------------------------------ page Mesure (docks)
+    def _page_mesure(self):
+        page = QtWidgets.QWidget(objectName="Page")
+        v = QtWidgets.QVBoxLayout(page)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(10)
+        self.banner = QtWidgets.QFrame(objectName="Banner")
+        bl = QtWidgets.QHBoxLayout(self.banner)
+        bl.setContentsMargins(16, 8, 12, 8)
+        bl.setSpacing(12)
+        self.banner_icon = QtWidgets.QLabel()
+        bt = QtWidgets.QLabel("Mode disposition", objectName="Title")
+        bt.setFont(ui_font(15, QtGui.QFont.DemiBold))
+        bh = QtWidgets.QLabel("Glissez un panneau par sa poignée ⋮⋮ · tirez les séparations pour redimensionner · double-clic sur un titre pour le détacher",
+                              objectName="BannerText")
+        bh.setWordWrap(True)
+        for w in (self.banner_icon, bt):
+            bl.addWidget(w)
+        bl.addWidget(bh, 1)
+        for txt, fn, name in (("Réinitialiser", lambda: self.apply_layout("Atelier"), "Ghost"), ("Annuler", self.cancel_edit, "Ghost"),
+                              ("Enregistrer la disposition", self.save_edit, "Info")):
+            b = QtWidgets.QPushButton(txt, objectName=name)
+            b.clicked.connect(fn)
+            bl.addWidget(b)
+        self.banner.hide()
+        v.addWidget(self.banner)
+        hb = QtWidgets.QHBoxLayout()
+        hb.setSpacing(12)
+        self.dockhost = QtWidgets.QMainWindow()
+        self.dockhost.setWindowFlags(Qt.Widget)
+        self.dockhost.setDockNestingEnabled(True)
+        self.dockhost.setDockOptions(QtWidgets.QMainWindow.AnimatedDocks | QtWidgets.QMainWindow.AllowNestedDocks |
+                                     QtWidgets.QMainWindow.AllowTabbedDocks)
+        self.docks, self.dock_titles = {}, {}
+        widgets = {"display": self._w_display(), "actions": self._w_actions(), "stats": self._w_stats(),
+                   "function": self._w_function(), "limits": self._w_limits(), "chart": self._w_chart()}
+        for key, title in DOCKS:
+            d = QtWidgets.QDockWidget(title, self.dockhost)
+            d.setObjectName("dock_" + key)
+            d.setWidget(widgets[key])
+            d.setTitleBarWidget(QtWidgets.QWidget())
+            d.setFeatures(QtWidgets.QDockWidget.NoDockWidgetFeatures)
+            d.topLevelChanged.connect(lambda _fl, k=key: self._dock_title(k))
+            d.visibilityChanged.connect(lambda _v, k=key: self._sync_dock_check(k))
+            self.docks[key] = d
+            self.dock_titles[key] = DockTitle(d, title)
+            self.dock_titles[key].hide()
+        hb.addWidget(self.dockhost, 1)
+        hb.addWidget(self._side_panel())
+        v.addLayout(hb, 1)
+        self.title_timer = QtCore.QTimer(self, interval=250, timeout=lambda: [t.update() for t in self.dock_titles.values()])
+        return page
 
-        fl = self._group(lv, "Acquisition")
-        self.cb_range = self.R("range", QtWidgets.QComboBox())
-        self.cb_range.activated.connect(self.set_range)
-        self.cb_speed = self.R("speed", QtWidgets.QComboBox())
-        self.cb_speed.addItems(["Lente (S)", "Moyenne (M)", "Rapide (F)"])
-        self.cb_speed.activated.connect(self.set_speed)
-        self.sp_int = self.R("interval", QtWidgets.QSpinBox(suffix=" ms", maximum=3_600_000, singleStep=100))
-        self.sp_int.valueChanged.connect(lambda v: self.worker and setattr(self.worker, "interval", v / 1000))
+    def _w_display(self):
+        self.disp = DisplayWidget()
+        self.disp.setMinimumHeight(150)
+        return self.disp
+
+    def _w_actions(self):
+        w = QtWidgets.QWidget(objectName="Transparent")
+        h = QtWidgets.QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(10)
+        self.bt_hold = ActionButton("hold", "HOLD", "H")
+        self.bt_hold.setCheckable(True)
+        self.bt_hold.toggled.connect(lambda on: setattr(self, "hold", on))
+        self.bt_rel = ActionButton("rel", "REL Δ", "R")
+        self.bt_rel.setCheckable(True)
+        self.bt_rel.toggled.connect(self.toggle_rel)
+        self.bt_snap = ActionButton("capture", "Capturer", "␣")
+        self.bt_snap.clicked.connect(lambda: self.capture(self.last_v))
+        self.bt_copy = ActionButton("copy", "Copier", "C")
+        self.bt_copy.clicked.connect(self.copy_value)
+        self.bt_clear = ActionButton("trash", "")
+        self.bt_clear.setToolTip("Effacer données et statistiques")
+        self.bt_clear.clicked.connect(self.clear_data)
+        self.act_rec = ActionButton("rec", "Enregistrer", "", variant="danger")
+        self.act_rec.setCheckable(True)
+        self.act_rec.clicked.connect(self._rec_clicked)
+        self.bt_run = ActionButton("pause", "")
+        self.bt_run.setCheckable(True)
+        self.bt_run.setToolTip("Pause / reprise de l'acquisition (P)")
+        self.bt_run.toggled.connect(self.toggle_run)
+        for b in (self.bt_hold, self.bt_rel, self.bt_snap, self.bt_copy, self.bt_clear):
+            h.addWidget(b)
+        h.addStretch()
+        h.addWidget(self.act_rec)
+        h.addWidget(self.bt_run)
+        w.setFixedHeight(46)
+        return w
+
+    def _w_stats(self):
+        self.statsp = StatsPanel(["N", "Min", "Max", "Moyenne", "σ", "Crête-crête", "σ / moy"])
+        self.st = {k: c.val for k, c in self.statsp.cards.items()}
+        self.statsp.setMinimumHeight(64)
+        self.statsp.setMaximumHeight(240)
+        return self.statsp
+
+    def _w_function(self):
+        f, v = card("Fonction")
+        self.func_card = f
+        self.fpad = FunctionPad()
+        self.fpad.picked.connect(self.on_func_pick)
+        v.addWidget(self.fpad)
+        v.addWidget(QtWidgets.QLabel("Gamme", objectName="Muted"))
+        self.range_sel = RangeSelector()
+        self.range_sel.picked.connect(self.on_range_pick)
+        v.addWidget(self.range_sel)
+        v.addWidget(QtWidgets.QLabel("Vitesse", objectName="Muted"))
+        self.speed_seg = SegmentBox(["Lente", "Moyenne", "Rapide"])
+        self.speed_seg.picked.connect(self.on_speed_pick)
+        v.addWidget(self.speed_seg)
         self.ck_dual = self.R("dual", QtWidgets.QCheckBox("2ᵉ affichage : fréquence (AC)"))
         self.ck_dual.toggled.connect(self.set_dual)
-        self.bt_run = QtWidgets.QPushButton("⏸ Pause acquisition", checkable=True, toggled=self.toggle_run)
-        fl.addRow("Gamme", self.cb_range)
-        fl.addRow("Vitesse", self.cb_speed)
-        fl.addRow("Intervalle", self.sp_int)
-        fl.addRow(self.ck_dual)
-        fl.addRow(self.bt_run)
+        v.addWidget(self.ck_dual)
+        v.addStretch()
+        # combos logiques (non affichés, mémorisés dans les profils)
+        self.cb_range = self.R("range", QtWidgets.QComboBox(f))
+        self.cb_speed = self.R("speed", QtWidgets.QComboBox(f))
+        self.cb_speed.addItems(["Lente (S)", "Moyenne (M)", "Rapide (F)"])
+        self.cb_range.hide()
+        self.cb_speed.hide()
+        sa = QtWidgets.QScrollArea(widgetResizable=True)
+        sa.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        sa.setWidget(f)
+        sa.setMinimumWidth(260)
+        return sa
 
-        fl = self._group(lv, "Affichage")
-        self.sp_dig = self.R("digits", QtWidgets.QSpinBox(minimum=3, maximum=8, value=6))
-        self.sp_avg = self.R("avg", QtWidgets.QSpinBox(minimum=1, maximum=500, value=1))
-        self.sp_avg.valueChanged.connect(lambda n: setattr(self, "filt", deque(self.filt, maxlen=n)))
-        fl.addRow("Chiffres significatifs", self.sp_dig)
-        fl.addRow("Moyenne glissante (N)", self.sp_avg)
-
-        fl = self._group(lv, "Maths de l'appareil")
-        self.cb_math = QtWidgets.QComboBox()
-        self.cb_math.addItems(["Aucune", "NULL (relatif)", "dB", "dBm", "Statistiques"])
-        self.cb_dbref = QtWidgets.QComboBox()
-        self.cb_dbref.addItems(DB_REFS)
-        self.cb_dbref.setCurrentText("600")
-        self.ed_null = QtWidgets.QLineEdit(placeholderText="offset ex. 12m")
-        hb = QtWidgets.QHBoxLayout()
-        hb.addWidget(QtWidgets.QPushButton("Appliquer", clicked=self.apply_math))
-        hb.addWidget(QtWidgets.QPushButton("Lire stats DMM", clicked=lambda: self.cmd("CALC:AVER:ALL?", "calc_all")))
-        fl.addRow("Fonction", self.cb_math)
-        fl.addRow("Réf. dB/dBm (Ω)", self.cb_dbref)
-        fl.addRow("Offset NULL", self.ed_null)
-        fl.addRow(hb)
-
-        fl = self._group(lv, "Réglages appareil")
-        self.cb_tunit = self.R("tunit", QtWidgets.QComboBox())
-        self.cb_tunit.addItems(["C", "F", "K"])
-        self.cb_tunit.activated.connect(self.set_tunit)
-        self.ed_cont = self.R("cont", QtWidgets.QLineEdit("50", maximumWidth=80))
-        self.ed_cont.editingFinished.connect(lambda: self.cmd(f"CONT:THRE {self.ed_cont.text().strip()}"))
-        self.ck_beep = QtWidgets.QCheckBox("Buzzer DMM", checked=True)
-        self.ck_beep.toggled.connect(lambda on: self.cmd(f"SYST:BEEP:STAT {'ON' if on else 'OFF'}"))
-        fl.addRow("Unité température", self.cb_tunit)
-        fl.addRow("Seuil continuité (Ω)", self.ed_cont)
-        fl.addRow(self.ck_beep)
-        fl.addRow(QtWidgets.QPushButton("Reset appareil (*RST)", clicked=lambda: self.cmd("*RST")))
-
-        fl = self._group(lv, "Limites PASS / FAIL")
-        self.ck_lim = self.R("lim_en", QtWidgets.QCheckBox("Activer"))
+    def _w_limits(self):
+        f, v = card(None)
+        top = QtWidgets.QHBoxLayout()
+        top.addWidget(card_title("Limites"))
+        top.addStretch()
+        self.ck_lim = self.R("lim_en", Switch())
+        self.ck_lim.toggled.connect(self.update_limits)
+        top.addWidget(self.ck_lim)
+        v.addLayout(top)
+        g = QtWidgets.QGridLayout()
+        g.setSpacing(8)
+        self.ed_nom = self.R("nom", QtWidgets.QLineEdit(placeholderText="ex. 4.7k"))
+        self.ed_tol = self.R("tol", QtWidgets.QLineEdit("1"))
         self.ed_lo = self.R("lim_lo", QtWidgets.QLineEdit(placeholderText="ex. 4.65k"))
         self.ed_hi = self.R("lim_hi", QtWidgets.QLineEdit(placeholderText="ex. 4.75k"))
-        self.ed_nom = self.R("nom", QtWidgets.QLineEdit(placeholderText="ex. 4.7k"))
-        self.ed_tol = self.R("tol", QtWidgets.QLineEdit("1", maximumWidth=60))
-        hb = QtWidgets.QHBoxLayout()
-        for w in (self.ed_nom, QtWidgets.QLabel("±"), self.ed_tol, QtWidgets.QLabel("%"),
-                  QtWidgets.QPushButton("→", clicked=self.nom_to_limits, maximumWidth=34)):
-            hb.addWidget(w)
-        self.ck_limbeep = self.R("lim_beep", QtWidgets.QCheckBox("Bip sur FAIL", checked=True))
-        self.ck_lim.toggled.connect(self.update_limits)
+        for w in (self.ed_nom, self.ed_tol, self.ed_lo, self.ed_hi):
+            w.setFont(mono(13))
         self.ed_lo.editingFinished.connect(self.update_limits)
         self.ed_hi.editingFinished.connect(self.update_limits)
-        fl.addRow(self.ck_lim)
-        fl.addRow("Mini", self.ed_lo)
-        fl.addRow("Maxi", self.ed_hi)
-        fl.addRow("Nominal", hb)
-        fl.addRow(self.ck_limbeep)
-        fl.addRow(QtWidgets.QPushButton("RAZ compteurs", clicked=self.reset_pf))
+        for i, (lab, w) in enumerate((("Nominal", self.ed_nom), ("Tolérance %", self.ed_tol), ("Mini", self.ed_lo), ("Maxi", self.ed_hi))):
+            box = QtWidgets.QVBoxLayout()
+            box.setSpacing(4)
+            box.addWidget(QtWidgets.QLabel(lab, objectName="Muted"))
+            box.addWidget(w)
+            g.addLayout(box, i // 2, i % 2)
+        v.addLayout(g)
+        row = QtWidgets.QHBoxLayout()
+        bt = QtWidgets.QPushButton("Nominal ± % → limites", clicked=self.nom_to_limits)
+        row.addWidget(bt)
+        row.addWidget(QtWidgets.QPushButton("RAZ compteurs", clicked=self.reset_pf))
+        v.addLayout(row)
+        self.ck_limbeep = self.R("lim_beep", QtWidgets.QCheckBox("Bip sur FAIL", checked=True))
+        v.addWidget(self.ck_limbeep)
+        bot = QtWidgets.QHBoxLayout()
+        self.lb_limrange = QtWidgets.QLabel("—", objectName="Muted")
+        pf = QtWidgets.QLabel("PASS 0 · FAIL 0", objectName="Muted")
+        bot.addWidget(self.lb_limrange)
+        bot.addStretch()
+        bot.addWidget(pf)
+        v.addLayout(bot)
+        v.addStretch()
+        self.st_pf = pf
+        return f
 
-        fl = self._group(lv, "Capture auto (valeur stable)")
-        self.ck_ah = self.R("ah_en", QtWidgets.QCheckBox("Activer"))
+    def _w_chart(self):
+        f, v = card(None, margins=(14, 12, 14, 12), spacing=8)
+        top = QtWidgets.QHBoxLayout()
+        top.setSpacing(10)
+        self.chart_seg = SegmentBox(["Graphique", "Histogramme"])
+        self.chart_seg.set_current(0)
+        top.addWidget(self.chart_seg)
+        top.addStretch()
+        self.ck_chartpause = QtWidgets.QCheckBox("Figer")
+        self.ck_mean = QtWidgets.QCheckBox("Moyenne")
+        self.ck_region = QtWidgets.QCheckBox("Région d'analyse")
+        self.ck_region.toggled.connect(self.toggle_region)
+        for w in (self.ck_chartpause, self.ck_mean, self.ck_region):
+            top.addWidget(w)
+        self.cb_win = self.R("chart_win", QtWidgets.QComboBox(f))
+        self.cb_win.addItems(["30 s", "1 min", "5 min", "15 min", "1 h", "Tout"])
+        self.cb_win.setCurrentIndex(1)
+        self.cb_win.hide()
+        self.win_seg = SegmentBox(["30 s", "1 min", "5 min", "15 min", "1 h", "Tout"])
+        self.win_seg.set_current(1)
+        self.win_seg.picked.connect(self.cb_win.setCurrentIndex)
+        top.addWidget(self.win_seg)
+        top.addWidget(QtWidgets.QPushButton("Auto-échelle", clicked=self.autoscale))
+        v.addLayout(top)
+        self.chart_stack = QtWidgets.QStackedWidget()
+        self.chart_seg.picked.connect(self.chart_stack.setCurrentIndex)
+        p0 = QtWidgets.QWidget(objectName="Transparent")
+        l0 = QtWidgets.QVBoxLayout(p0)
+        l0.setContentsMargins(0, 0, 0, 0)
+        self.plot = self._plot(axisItems={"bottom": pg.DateAxisItem()})
+        self.plot.setDownsampling(auto=True, mode="peak")
+        self.plot.setClipToView(True)
+        self.curve = self.plot.plot()
+        self.ln_lo = pg.InfiniteLine(angle=0)
+        self.ln_hi = pg.InfiniteLine(angle=0)
+        self.ln_mean = pg.InfiniteLine(angle=0)
+        for ln in (self.ln_lo, self.ln_hi, self.ln_mean):
+            self.plot.addItem(ln)
+            ln.hide()
+        self.region = pg.LinearRegionItem()
+        self.region.sigRegionChanged.connect(self.update_region)
+        self.plot.addItem(self.region)
+        self.region.hide()
+        l0.addWidget(self.plot)
+        self.lb_region = QtWidgets.QLabel("")
+        self.lb_region.setFont(mono(11))
+        self.lb_region.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.lb_region.hide()
+        l0.addWidget(self.lb_region)
+        p1 = QtWidgets.QWidget(objectName="Transparent")
+        l1 = QtWidgets.QVBoxLayout(p1)
+        l1.setContentsMargins(0, 0, 0, 0)
+        hb = QtWidgets.QHBoxLayout()
+        self.sp_bins = self.R("hist_bins", QtWidgets.QSpinBox(minimum=5, maximum=500, value=50))
+        hb.addWidget(QtWidgets.QLabel("Classes", objectName="Muted"))
+        hb.addWidget(self.sp_bins)
+        hb.addStretch()
+        l1.addLayout(hb)
+        self.hplot = self._plot()
+        l1.addWidget(self.hplot)
+        self.chart_stack.addWidget(p0)
+        self.chart_stack.addWidget(p1)
+        v.addWidget(self.chart_stack, 1)
+        return f
+
+    def _side_panel(self):
+        self.side = QtWidgets.QFrame(objectName="SidePanel")
+        self.side.setFixedWidth(300)
+        v = QtWidgets.QVBoxLayout(self.side)
+        v.setContentsMargins(16, 16, 16, 16)
+        v.setSpacing(10)
+        v.addWidget(card_title("Panneaux"))
+        self.dock_checks = {}
+        for key, title in DOCKS:
+            ck = QtWidgets.QCheckBox(title, checked=True)
+            ck.toggled.connect(lambda on, k=key: self.docks[k].setVisible(on))
+            self.dock_checks[key] = ck
+            v.addWidget(ck)
+        v.addSpacing(8)
+        v.addWidget(card_title("Dispositions"))
+        self.preset_box = QtWidgets.QWidget(objectName="Transparent")
+        self.preset_grid = QtWidgets.QGridLayout(self.preset_box)
+        self.preset_grid.setContentsMargins(0, 0, 0, 0)
+        self.preset_grid.setSpacing(10)
+        v.addWidget(self.preset_box)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QPushButton("Enregistrer sous…", clicked=self.save_layout_as))
+        row.addWidget(QtWidgets.QPushButton("Supprimer…", clicked=self.delete_layout))
+        v.addLayout(row)
+        v.addStretch()
+        hint = QtWidgets.QLabel("Astuce : un panneau détaché devient une fenêtre indépendante, utile sur un second écran.", objectName="Muted")
+        hint.setWordWrap(True)
+        v.addWidget(hint)
+        self.side.hide()
+        self._refresh_presets()
+        return self.side
+
+    # ------------------------------------------------------------ autres sections
+    def _page(self):
+        p = QtWidgets.QWidget(objectName="Page")
+        h = QtWidgets.QHBoxLayout(p)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(14)
+        return p, h
+
+    def _col(self, width=340):
+        w = QtWidgets.QWidget(objectName="Transparent")
+        w.setFixedWidth(width)
+        v = QtWidgets.QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(14)
+        return w, v
+
+    def _page_analyse(self):
+        p, h = self._page()
+        col, cv = self._col()
+        f, v = card("Comparaison d'enregistrements")
+        v.addWidget(QtWidgets.QPushButton("Charger des CSV…", clicked=self.load_traces))
+        v.addWidget(QtWidgets.QPushButton("Ajouter la session courante", clicked=self.add_current_trace))
+        self.lw_traces = QtWidgets.QListWidget()
+        self.lw_traces.itemChanged.connect(lambda _: self.draw_compare())
+        v.addWidget(self.lw_traces, 1)
+        v.addWidget(QtWidgets.QPushButton("Supprimer la sélection", clicked=self.remove_trace))
+        cv.addWidget(f, 1)
+        f, v = card("Intégration (charge / énergie)")
+        self.lb_integ = QtWidgets.QLabel("—")
+        self.lb_integ.setFont(mono(13))
+        self.lb_integ.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        v.addWidget(self.lb_integ)
+        fl = QtWidgets.QFormLayout()
+        self.ed_volt = self.R("integ_v", QtWidgets.QLineEdit("12"))
+        fl.addRow("Tension pour Wh (V)", self.ed_volt)
+        v.addLayout(fl)
+        v.addWidget(QtWidgets.QPushButton("RAZ intégrale", clicked=self.reset_integ))
+        cv.addWidget(f)
+        h.addWidget(col)
+        f, v = card("Courbes superposées")
+        self.cmpplot = self._plot()
+        self.cmpplot.setLabel("bottom", "Temps", units="s")
+        self.cmpplot.addLegend()
+        v.addWidget(self.cmpplot, 1)
+        h.addWidget(f, 1)
+        return p
+
+    def _page_tri(self):
+        p, h = self._page()
+        col, cv = self._col()
+        f, v = card("Capture automatique")
+        fl = QtWidgets.QFormLayout()
+        fl.setVerticalSpacing(10)
+        self.ck_ah = self.R("ah_en", Switch("Activer"))
         self.sp_ahn = self.R("ah_n", QtWidgets.QSpinBox(minimum=2, maximum=100, value=5))
         self.sp_ahn.valueChanged.connect(lambda n: setattr(self, "ah_buf", deque(maxlen=n)))
         self.sp_ahtol = self.R("ah_tol", QtWidgets.QDoubleSpinBox(decimals=3, minimum=0.001, maximum=50, value=0.2, suffix=" %"))
@@ -317,9 +661,235 @@ class Main(QtWidgets.QMainWindow):
         fl.addRow("Échantillons stables", self.sp_ahn)
         fl.addRow("Tolérance", self.sp_ahtol)
         fl.addRow("|Valeur| mini", self.ed_ahmin)
+        v.addLayout(fl)
+        cv.addWidget(f)
+        f, v = card("Tri en bacs")
+        fl = QtWidgets.QFormLayout()
+        fl.setVerticalSpacing(10)
+        self.ck_bin = self.R("bin_en", Switch("Activer"))
+        self.cb_bin = self.R("bin_series", QtWidgets.QComboBox())
+        self.cb_bin.addItems(list(SERIES))
+        self.cb_bin.setCurrentText("E24")
+        self.sp_bintol = self.R("bin_tol", QtWidgets.QDoubleSpinBox(decimals=2, minimum=0.01, maximum=50, value=5, suffix=" %"))
+        fl.addRow(self.ck_bin)
+        fl.addRow("Série", self.cb_bin)
+        fl.addRow("Tolérance", self.sp_bintol)
+        v.addLayout(fl)
+        cv.addWidget(f)
+        cv.addStretch()
+        h.addWidget(col)
+        f, v = card("Captures")
+        self.tbl = QtWidgets.QTableWidget(0, 7)
+        self.tbl.setHorizontalHeaderLabels(["#", "Heure", "Valeur", "Brut", "Statut", "Bac", "Écart %"])
+        self.tbl.horizontalHeader().setStretchLastSection(True)
+        self.tbl.verticalHeader().hide()
+        self.tbl.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        v.addWidget(self.tbl, 1)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QPushButton("Exporter CSV", clicked=self.export_captures))
+        row.addWidget(QtWidgets.QPushButton("Vider", clicked=self.clear_captures))
+        row.addStretch()
+        v.addLayout(row)
+        h.addWidget(f, 1)
+        f, v = card("Bacs")
+        f.setFixedWidth(260)
+        self.tbl_bins = QtWidgets.QTableWidget(0, 2)
+        self.tbl_bins.setHorizontalHeaderLabels(["Bac", "Nombre"])
+        self.tbl_bins.horizontalHeader().setStretchLastSection(True)
+        self.tbl_bins.verticalHeader().hide()
+        self.tbl_bins.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        v.addWidget(self.tbl_bins, 1)
+        h.addWidget(f)
+        return p
 
-        fl = self._group(lv, "Enregistrement CSV")
-        self.bt_rec = QtWidgets.QPushButton("● Démarrer / armer", checkable=True, toggled=self.toggle_rec)
+    def _page_batt(self):
+        p, h = self._page()
+        col, cv = self._col()
+        f, v = card("Décharge batterie")
+        fl = QtWidgets.QFormLayout()
+        fl.setVerticalSpacing(10)
+        self.cb_batload = self.R("bat_load", QtWidgets.QComboBox())
+        self.cb_batload.addItems(["Courant constant (A)", "Charge résistive (Ω)"])
+        self.ed_batval = self.R("bat_val", QtWidgets.QLineEdit("1"))
+        self.ed_batcut = self.R("bat_cut", QtWidgets.QLineEdit("10.5"))
+        fl.addRow("Charge", self.cb_batload)
+        fl.addRow("Valeur", self.ed_batval)
+        fl.addRow("Coupure (V)", self.ed_batcut)
+        v.addLayout(fl)
+        self.bt_bat = QtWidgets.QPushButton("Démarrer la décharge", checkable=True, objectName="Primary")
+        self.bt_bat.toggled.connect(self.toggle_battery)
+        v.addWidget(self.bt_bat)
+        v.addWidget(QtWidgets.QPushButton("Mémoriser la tension à vide", clicked=self.bat_v0))
+        v.addWidget(QtWidgets.QPushButton("Calculer R interne (sous charge)", clicked=self.bat_rint))
+        self.lb_bat = QtWidgets.QLabel("Mesure en V DC aux bornes de la batterie.", wordWrap=True)
+        self.lb_bat.setFont(mono(12))
+        self.lb_bat.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        v.addWidget(self.lb_bat)
+        v.addStretch()
+        cv.addWidget(f, 1)
+        h.addWidget(col)
+        f, v = card("Courbe de décharge")
+        self.bplot = self._plot()
+        self.bplot.setLabel("bottom", "Capacité", units="Ah")
+        self.bplot.setLabel("left", "Tension", units="V")
+        self.bcurve = self.bplot.plot()
+        v.addWidget(self.bplot, 1)
+        h.addWidget(f, 1)
+        return p
+
+    def _page_conso(self):
+        p, h = self._page()
+        col, cv = self._col(360)
+        f, v = card("Consommation veille / réveil")
+        fl = QtWidgets.QFormLayout()
+        fl.setVerticalSpacing(10)
+        self.ed_cthr = self.R("cons_thr", QtWidgets.QLineEdit("1m"))
+        self.ed_ccap = self.R("cons_cap", QtWidgets.QLineEdit("2000"))
+        self.ck_clive = self.R("cons_live", Switch("Analyse continue"))
+        hb = QtWidgets.QHBoxLayout()
+        hb.addWidget(self.ed_cthr)
+        hb.addWidget(QtWidgets.QPushButton("Auto", clicked=self.cons_auto))
+        fl.addRow("Seuil (A)", hb)
+        fl.addRow("Batterie (mAh)", self.ed_ccap)
+        fl.addRow(self.ck_clive)
+        v.addLayout(fl)
+        v.addWidget(QtWidgets.QPushButton("Analyser la fenêtre affichée", clicked=self.cons_analyse, objectName="Primary"))
+        self.lb_cons = QtWidgets.QLabel("Mesure en A DC, sur la fenêtre du graphique de la page Mesure.", wordWrap=True)
+        self.lb_cons.setFont(mono(12))
+        self.lb_cons.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        v.addWidget(self.lb_cons)
+        v.addStretch()
+        cv.addWidget(f, 1)
+        h.addWidget(col)
+        f, v = card("Courant")
+        self.cplot_c = self._plot(axisItems={"bottom": pg.DateAxisItem()})
+        self.ccurve = self.cplot_c.plot()
+        self.cthr_line = pg.InfiniteLine(angle=0)
+        self.cplot_c.addItem(self.cthr_line)
+        v.addWidget(self.cplot_c, 1)
+        h.addWidget(f, 1)
+        return p
+
+    def _page_seq(self):
+        p, h = self._page()
+        f, v = card(None)
+        hb = QtWidgets.QHBoxLayout()
+        hb.addWidget(card_title("Séquence de test"))
+        hb.addSpacing(10)
+        self.bt_seqrun = QtWidgets.QPushButton("Exécuter", clicked=self.seq_run, objectName="Primary")
+        self.bt_seqstop = QtWidgets.QPushButton("Arrêter", clicked=lambda: self.seq.stop())
+        for x in (self.bt_seqrun, self.bt_seqstop, QtWidgets.QPushButton("Ouvrir…", clicked=self.seq_load),
+                  QtWidgets.QPushButton("Enregistrer…", clicked=self.seq_save),
+                  QtWidgets.QPushButton("Exemple", clicked=lambda: self.ed_seq.setPlainText(EXAMPLE)),
+                  QtWidgets.QPushButton("Aide", clicked=lambda: QtWidgets.QMessageBox.information(self, "Séquences", HELP))):
+            hb.addWidget(x)
+        hb.addStretch()
+        self.lb_verdict = QtWidgets.QLabel("")
+        self.lb_verdict.setFont(ui_font(18, QtGui.QFont.Bold))
+        hb.addWidget(self.lb_verdict)
+        v.addLayout(hb)
+        sp = QtWidgets.QSplitter()
+        self.ed_seq = QtWidgets.QPlainTextEdit()
+        self.ed_seq.setFont(mono(13))
+        self.ed_seq.setPlainText(self.cfg.value("seq_text", EXAMPLE))
+        self.seq_out = QtWidgets.QPlainTextEdit(readOnly=True)
+        self.seq_out.setFont(mono(13))
+        sp.addWidget(self.ed_seq)
+        sp.addWidget(self.seq_out)
+        v.addWidget(sp, 1)
+        h.addWidget(f, 1)
+        return p
+
+    def _page_journal(self):
+        p, h = self._page()
+        sp = QtWidgets.QSplitter()
+        f, v = card("Événements")
+        self.tbl_ev = QtWidgets.QTableWidget(0, 4)
+        self.tbl_ev.setHorizontalHeaderLabels(["Heure", "Type", "Valeur", "Détail"])
+        self.tbl_ev.horizontalHeader().setStretchLastSection(True)
+        self.tbl_ev.verticalHeader().hide()
+        self.tbl_ev.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        v.addWidget(self.tbl_ev, 1)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QPushButton("Exporter CSV", clicked=lambda: self._export_table(self.tbl_ev, "evenements.csv")))
+        row.addWidget(QtWidgets.QPushButton("Vider", clicked=self.clear_events))
+        row.addStretch()
+        v.addLayout(row)
+        sp.addWidget(f)
+        f, v = card("Console SCPI")
+        self.con_out = QtWidgets.QPlainTextEdit(readOnly=True)
+        self.con_out.setFont(mono(12))
+        self.con_in = QtWidgets.QLineEdit(placeholderText="Commande SCPI (ex. FUNC?, RANGE?, CALC:AVER:ALL?) + Entrée")
+        self.con_in.setFont(mono(13))
+        self.con_in.returnPressed.connect(self.console_send)
+        self.con_hist, self.con_hi = [], 0
+        self.con_in.installEventFilter(self)
+        v.addWidget(self.con_out, 1)
+        v.addWidget(self.con_in)
+        sp.addWidget(f)
+        h.addWidget(sp, 1)
+        return p
+
+    def _group(self, grid, title, pos):
+        f, v = card(title)
+        fl = QtWidgets.QFormLayout()
+        fl.setVerticalSpacing(10)
+        fl.setHorizontalSpacing(14)
+        v.addLayout(fl)
+        v.addStretch()
+        grid.addWidget(f, *pos)
+        return fl
+
+    def _page_reglages(self):
+        sa = QtWidgets.QScrollArea(widgetResizable=True)
+        inner = QtWidgets.QWidget(objectName="Transparent")
+        g = QtWidgets.QGridLayout(inner)
+        g.setContentsMargins(0, 0, 8, 0)
+        g.setSpacing(14)
+        for c in range(3):
+            g.setColumnStretch(c, 1)
+        sa.setWidget(inner)
+
+        fl = self._group(g, "Acquisition & affichage", (0, 0))
+        self.sp_int = self.R("interval", QtWidgets.QSpinBox(suffix=" ms", maximum=3_600_000, singleStep=100))
+        self.sp_int.valueChanged.connect(lambda v: self.worker and setattr(self.worker, "interval", v / 1000))
+        self.sp_dig = self.R("digits", QtWidgets.QSpinBox(minimum=3, maximum=8, value=6))
+        self.sp_avg = self.R("avg", QtWidgets.QSpinBox(minimum=1, maximum=500, value=1))
+        self.sp_avg.valueChanged.connect(lambda n: (setattr(self, "filt", deque(self.filt, maxlen=n)), self.update_mode_label()))
+        fl.addRow("Intervalle entre mesures", self.sp_int)
+        fl.addRow("Chiffres significatifs", self.sp_dig)
+        fl.addRow("Moyenne glissante (N)", self.sp_avg)
+
+        fl = self._group(g, "Maths de l'appareil", (0, 1))
+        self.cb_math = QtWidgets.QComboBox()
+        self.cb_math.addItems(["Aucune", "NULL (relatif)", "dB", "dBm", "Statistiques"])
+        self.cb_dbref = QtWidgets.QComboBox()
+        self.cb_dbref.addItems(DB_REFS)
+        self.cb_dbref.setCurrentText("600")
+        self.ed_null = QtWidgets.QLineEdit(placeholderText="offset ex. 12m")
+        hb = QtWidgets.QHBoxLayout()
+        hb.addWidget(QtWidgets.QPushButton("Appliquer", clicked=self.apply_math, objectName="Primary"))
+        hb.addWidget(QtWidgets.QPushButton("Lire stats DMM", clicked=lambda: self.cmd("CALC:AVER:ALL?", "calc_all")))
+        fl.addRow("Fonction", self.cb_math)
+        fl.addRow("Réf. dB/dBm (Ω)", self.cb_dbref)
+        fl.addRow("Offset NULL", self.ed_null)
+        fl.addRow(hb)
+
+        fl = self._group(g, "Réglages appareil", (0, 2))
+        self.cb_tunit = self.R("tunit", QtWidgets.QComboBox())
+        self.cb_tunit.addItems(["C", "F", "K"])
+        self.cb_tunit.activated.connect(self.set_tunit)
+        self.ed_cont = self.R("cont", QtWidgets.QLineEdit("50"))
+        self.ed_cont.editingFinished.connect(lambda: self.cmd(f"CONT:THRE {self.ed_cont.text().strip()}"))
+        self.ck_beep = Switch("Buzzer du multimètre")
+        self.ck_beep.setChecked(True)
+        self.ck_beep.toggled.connect(lambda on: self.cmd(f"SYST:BEEP:STAT {'ON' if on else 'OFF'}"))
+        fl.addRow("Unité température", self.cb_tunit)
+        fl.addRow("Seuil continuité (Ω)", self.ed_cont)
+        fl.addRow(self.ck_beep)
+        fl.addRow(QtWidgets.QPushButton("Reset appareil (*RST)", clicked=lambda: self.cmd("*RST")))
+
+        fl = self._group(g, "Enregistrement CSV", (1, 0))
         self.cb_trig = self.R("trig", QtWidgets.QComboBox())
         self.cb_trig.addItems(["Immédiat", "Seuil montant", "Seuil descendant", "À une heure"])
         self.ed_trigthr = self.R("trig_thr", QtWidgets.QLineEdit("0"))
@@ -328,7 +898,9 @@ class Main(QtWidgets.QMainWindow):
         self.sp_recdur = self.R("rec_dur", QtWidgets.QSpinBox(maximum=10_000_000, suffix=" s", specialValueText="illimitée"))
         self.sp_recdec = self.R("rec_dec", QtWidgets.QSpinBox(minimum=1, maximum=10000, value=1, prefix="1 mesure / "))
         self.ck_csvfr = QtWidgets.QCheckBox("Format Excel FR ( ; et virgule)", checked=True)
-        self.lb_rec = QtWidgets.QLabel("—", wordWrap=True)
+        self.bt_rec = QtWidgets.QPushButton("Démarrer / armer", checkable=True, objectName="Primary")
+        self.bt_rec.toggled.connect(self.toggle_rec)
+        self.lb_rec = QtWidgets.QLabel("—", wordWrap=True, objectName="Muted")
         fl.addRow("Déclencheur", self.cb_trig)
         fl.addRow("Seuil", self.ed_trigthr)
         fl.addRow("Heure", self.te_trig)
@@ -338,16 +910,8 @@ class Main(QtWidgets.QMainWindow):
         fl.addRow(self.bt_rec)
         fl.addRow(self.lb_rec)
 
-        fl = self._group(lv, "Intégration (charge / énergie)")
-        self.lb_integ = QtWidgets.QLabel("—")
-        self.lb_integ.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.ed_volt = self.R("integ_v", QtWidgets.QLineEdit("12", maximumWidth=80))
-        fl.addRow(self.lb_integ)
-        fl.addRow("Tension pour Wh (V)", self.ed_volt)
-        fl.addRow(QtWidgets.QPushButton("RAZ intégrale", clicked=self.reset_integ))
-
-        fl = self._group(lv, "Surveillance (anomalies)")
-        self.ck_an = self.R("an_en", QtWidgets.QCheckBox("Activer"))
+        fl = self._group(g, "Surveillance (anomalies)", (1, 1))
+        self.ck_an = self.R("an_en", Switch("Activer"))
         self.ck_an_ol = self.R("an_ol", QtWidgets.QCheckBox("Dépassement / OL", checked=True))
         self.ck_an_spike = self.R("an_spike", QtWidgets.QCheckBox("Pics", checked=True))
         self.sp_an_k = self.R("an_k", QtWidgets.QDoubleSpinBox(minimum=2, maximum=100, value=6, suffix=" σ"))
@@ -357,22 +921,20 @@ class Main(QtWidgets.QMainWindow):
         self.sp_an_dthr = self.R("an_dthr", QtWidgets.QDoubleSpinBox(decimals=3, minimum=0.001, maximum=100, value=0.5, suffix=" %/min"))
         self.sp_an_dwin = self.R("an_dwin", QtWidgets.QSpinBox(minimum=10, maximum=3600, value=60, suffix=" s"))
         self.ck_an_beep = self.R("an_beep", QtWidgets.QCheckBox("Bip / annonce", checked=True))
-        hb = QtWidgets.QHBoxLayout()
-        hb.addWidget(self.ck_an_spike)
-        hb.addWidget(self.sp_an_k)
-        hb.addWidget(self.sp_an_n)
-        hb2 = QtWidgets.QHBoxLayout()
-        hb2.addWidget(self.ck_an_drift)
-        hb2.addWidget(self.sp_an_dthr)
-        hb2.addWidget(self.sp_an_dwin)
         fl.addRow(self.ck_an)
         fl.addRow(self.ck_an_ol)
+        hb = QtWidgets.QHBoxLayout()
+        for w in (self.ck_an_spike, self.sp_an_k, self.sp_an_n):
+            hb.addWidget(w)
         fl.addRow(hb)
         fl.addRow("Décrochage si |v| <", self.ed_an_low)
-        fl.addRow(hb2)
+        hb = QtWidgets.QHBoxLayout()
+        for w in (self.ck_an_drift, self.sp_an_dthr, self.sp_an_dwin):
+            hb.addWidget(w)
+        fl.addRow(hb)
         fl.addRow(self.ck_an_beep)
 
-        fl = self._group(lv, "Annonce vocale")
+        fl = self._group(g, "Annonce vocale", (1, 2))
         self.cb_tts = self.R("tts", QtWidgets.QComboBox())
         self.cb_tts.addItems(["Désactivée", "Périodique", "Sur capture", "Sur FAIL / anomalie", "Capture + FAIL"])
         self.sp_tts = self.R("tts_int", QtWidgets.QSpinBox(minimum=2, maximum=3600, value=10, suffix=" s"))
@@ -381,279 +943,22 @@ class Main(QtWidgets.QMainWindow):
         fl.addRow(QtWidgets.QPushButton("Tester", clicked=lambda: self.speaker.say(
             speak_si(self.last_v, self.unit(), 4, self.noprefix()) if self.last_v is not None else "Synthèse vocale active")))
 
-        fl = self._group(lv, "Services réseau")
-        self.ck_web = QtWidgets.QCheckBox("Serveur web local")
+        fl = self._group(g, "Services réseau", (2, 0))
+        self.ck_web = Switch("Serveur web local")
         self.sp_webport = QtWidgets.QSpinBox(minimum=1024, maximum=65535, value=8088)
         self.ck_web.toggled.connect(self.toggle_web)
         self.lb_web = QtWidgets.QLabel("", openExternalLinks=True, textInteractionFlags=Qt.TextBrowserInteraction)
-        self.ck_mqtt = QtWidgets.QCheckBox("Publication MQTT")
+        self.ck_mqtt = Switch("Publication MQTT")
         self.ck_mqtt.toggled.connect(self.toggle_mqtt)
-        self.lb_mqtt = QtWidgets.QLabel("", wordWrap=True)
-        hb = QtWidgets.QHBoxLayout()
-        hb.addWidget(self.ck_web)
-        hb.addWidget(QtWidgets.QLabel("port"))
-        hb.addWidget(self.sp_webport)
-        hb2 = QtWidgets.QHBoxLayout()
-        hb2.addWidget(self.ck_mqtt)
-        hb2.addWidget(QtWidgets.QPushButton("Configurer…", clicked=self.mqtt_dialog))
-        fl.addRow(hb)
+        self.lb_mqtt = QtWidgets.QLabel("", wordWrap=True, objectName="Muted")
+        fl.addRow(self.ck_web)
+        fl.addRow("Port", self.sp_webport)
         fl.addRow(self.lb_web)
-        fl.addRow(hb2)
+        fl.addRow(self.ck_mqtt)
+        fl.addRow(QtWidgets.QPushButton("Configurer MQTT…", clicked=self.mqtt_dialog))
         fl.addRow(self.lb_mqtt)
-        lv.addStretch()
-
-    def _build_display(self, rv):
-        disp = QtWidgets.QFrame(objectName="disp")
-        disp.setStyleSheet("#disp{background:#05080a;border:2px solid #1e3a2a;border-radius:10px;}")
-        dl = QtWidgets.QGridLayout(disp)
-        self.lb_mode = QtWidgets.QLabel("")
-        self.lb_flags = QtWidgets.QLabel("")
-        self.lb_main = QtWidgets.QLabel("-----", alignment=Qt.AlignRight | Qt.AlignVCenter)
-        self.lb_main.setFont(QtGui.QFont("Consolas", 64, QtGui.QFont.Bold))
-        self.lb_main.setStyleSheet("color:#4cff7a;")
-        self.lb_sec = QtWidgets.QLabel("", alignment=Qt.AlignRight)
-        self.lb_sec.setFont(QtGui.QFont("Consolas", 22))
-        self.lb_sec.setStyleSheet("color:#7ad7ff;")
-        self.lb_pf = QtWidgets.QLabel("", alignment=Qt.AlignCenter, minimumWidth=110)
-        self.lb_pf.setFont(QtGui.QFont("Segoe UI", 20, QtGui.QFont.Bold))
-        for w in (self.lb_mode, self.lb_flags):
-            w.setFont(QtGui.QFont("Segoe UI", 12))
-            w.setStyleSheet("color:#c8c8c8;")
-        dl.addWidget(self.lb_mode, 0, 0)
-        dl.addWidget(self.lb_flags, 0, 1, alignment=Qt.AlignRight)
-        dl.addWidget(self.lb_main, 1, 0, 1, 2)
-        dl.addWidget(self.lb_pf, 2, 0, alignment=Qt.AlignLeft)
-        dl.addWidget(self.lb_sec, 2, 1)
-        rv.addWidget(disp)
-        hb = QtWidgets.QHBoxLayout()
-        self.bt_hold = QtWidgets.QPushButton("HOLD (H)", checkable=True, toggled=lambda on: setattr(self, "hold", on))
-        self.bt_rel = QtWidgets.QPushButton("REL Δ (R)", checkable=True, toggled=self.toggle_rel)
-        self.bt_snap = QtWidgets.QPushButton("📌 Capturer (Espace)", clicked=lambda: self.capture(self.last_v))
-        self.bt_copy = QtWidgets.QPushButton("Copier (C)", clicked=self.copy_value)
-        self.bt_clear = QtWidgets.QPushButton("Effacer données / stats", clicked=self.clear_data)
-        for b in (self.bt_hold, self.bt_rel, self.bt_snap, self.bt_copy, self.bt_clear):
-            hb.addWidget(b)
-        rv.addLayout(hb)
-        self.stat_box = QtWidgets.QGroupBox("Statistiques locales")
-        sl = QtWidgets.QGridLayout(self.stat_box)
-        self.st = {}
-        for i, k in enumerate(["N", "Min", "Max", "Moyenne", "σ", "Crête-crête", "σ / moy", "PASS / FAIL"]):
-            lab = QtWidgets.QLabel("—")
-            lab.setFont(QtGui.QFont("Consolas", 11))
-            lab.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            sl.addWidget(QtWidgets.QLabel(k + " :"), i // 4, (i % 4) * 2)
-            sl.addWidget(lab, i // 4, (i % 4) * 2 + 1)
-            self.st[k] = lab
-        rv.addWidget(self.stat_box)
-
-    def _tab_chart(self):
-        w = QtWidgets.QWidget()
-        v = QtWidgets.QVBoxLayout(w)
-        hb = QtWidgets.QHBoxLayout()
-        self.cb_win = self.R("chart_win", QtWidgets.QComboBox())
-        self.cb_win.addItems(["30 s", "1 min", "5 min", "15 min", "1 h", "Tout"])
-        self.cb_win.setCurrentIndex(1)
-        self.ck_chartpause = QtWidgets.QCheckBox("Figer")
-        self.ck_mean = QtWidgets.QCheckBox("Ligne moyenne")
-        self.ck_region = QtWidgets.QCheckBox("Région d'analyse (curseurs)")
-        self.ck_region.toggled.connect(self.toggle_region)
-        for x in (QtWidgets.QLabel("Fenêtre :"), self.cb_win, self.ck_chartpause, self.ck_mean, self.ck_region,
-                  QtWidgets.QPushButton("Auto-échelle (A)", clicked=self.autoscale)):
-            hb.addWidget(x)
-        hb.addStretch()
-        v.addLayout(hb)
-        self.plot = self._plot(axisItems={"bottom": pg.DateAxisItem()})
-        self.plot.setDownsampling(auto=True, mode="peak")
-        self.plot.setClipToView(True)
-        self.curve = self.plot.plot(pen=pg.mkPen(self.colors["curve"], width=1.5))
-        self.ln_lo = pg.InfiniteLine(angle=0, pen=pg.mkPen("#ff5050", style=Qt.DashLine))
-        self.ln_hi = pg.InfiniteLine(angle=0, pen=pg.mkPen("#ff5050", style=Qt.DashLine))
-        self.ln_mean = pg.InfiniteLine(angle=0, pen=pg.mkPen("#ffb000", style=Qt.DotLine))
-        for ln in (self.ln_lo, self.ln_hi, self.ln_mean):
-            self.plot.addItem(ln)
-            ln.hide()
-        self.region = pg.LinearRegionItem(brush=pg.mkBrush(80, 160, 255, 40))
-        self.region.sigRegionChanged.connect(self.update_region)
-        self.plot.addItem(self.region)
-        self.region.hide()
-        v.addWidget(self.plot)
-        self.lb_region = QtWidgets.QLabel("")
-        self.lb_region.setFont(QtGui.QFont("Consolas", 10))
-        self.lb_region.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        v.addWidget(self.lb_region)
-        self.tabs.addTab(w, "Graphique")
-
-    def _tab_hist(self):
-        w = QtWidgets.QWidget()
-        v = QtWidgets.QVBoxLayout(w)
-        hb = QtWidgets.QHBoxLayout()
-        self.sp_bins = self.R("hist_bins", QtWidgets.QSpinBox(minimum=5, maximum=500, value=50))
-        hb.addWidget(QtWidgets.QLabel("Classes :"))
-        hb.addWidget(self.sp_bins)
-        hb.addStretch()
-        v.addLayout(hb)
-        self.hplot = self._plot()
-        v.addWidget(self.hplot)
-        self.tabs.addTab(w, "Histogramme")
-
-    def _tab_captures(self):
-        w = QtWidgets.QWidget()
-        v = QtWidgets.QVBoxLayout(w)
-        hb = QtWidgets.QHBoxLayout()
-        self.ck_bin = self.R("bin_en", QtWidgets.QCheckBox("Tri en bacs (série E)"))
-        self.cb_bin = self.R("bin_series", QtWidgets.QComboBox())
-        self.cb_bin.addItems(list(SERIES))
-        self.cb_bin.setCurrentText("E24")
-        self.sp_bintol = self.R("bin_tol", QtWidgets.QDoubleSpinBox(decimals=2, minimum=0.01, maximum=50, value=5, suffix=" %"))
-        for x in (self.ck_bin, QtWidgets.QLabel("Série"), self.cb_bin, QtWidgets.QLabel("Tolérance"), self.sp_bintol):
-            hb.addWidget(x)
-        hb.addStretch()
-        hb.addWidget(QtWidgets.QPushButton("Exporter CSV", clicked=self.export_captures))
-        hb.addWidget(QtWidgets.QPushButton("Vider", clicked=self.clear_captures))
-        v.addLayout(hb)
-        sp = QtWidgets.QSplitter()
-        self.tbl = QtWidgets.QTableWidget(0, 7)
-        self.tbl.setHorizontalHeaderLabels(["#", "Heure", "Valeur", "Brut", "Statut", "Bac", "Écart %"])
-        self.tbl.horizontalHeader().setStretchLastSection(True)
-        self.tbl.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.tbl_bins = QtWidgets.QTableWidget(0, 2)
-        self.tbl_bins.setHorizontalHeaderLabels(["Bac", "Nombre"])
-        self.tbl_bins.horizontalHeader().setStretchLastSection(True)
-        self.tbl_bins.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        sp.addWidget(self.tbl)
-        sp.addWidget(self.tbl_bins)
-        sp.setSizes([700, 250])
-        v.addWidget(sp)
-        self.tabs.addTab(w, "Captures / tri")
-
-    def _tab_events(self):
-        w = QtWidgets.QWidget()
-        v = QtWidgets.QVBoxLayout(w)
-        self.tbl_ev = QtWidgets.QTableWidget(0, 4)
-        self.tbl_ev.setHorizontalHeaderLabels(["Heure", "Type", "Valeur", "Détail"])
-        self.tbl_ev.horizontalHeader().setStretchLastSection(True)
-        self.tbl_ev.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        hb = QtWidgets.QHBoxLayout()
-        hb.addWidget(QtWidgets.QPushButton("Exporter CSV", clicked=lambda: self._export_table(self.tbl_ev, "evenements.csv")))
-        hb.addWidget(QtWidgets.QPushButton("Vider", clicked=lambda: (self.tbl_ev.setRowCount(0), self.tabs.setTabText(3, "Événements"))))
-        hb.addStretch()
-        v.addWidget(self.tbl_ev)
-        v.addLayout(hb)
-        self.tabs.addTab(w, "Événements")
-
-    def _tab_battery(self):
-        w = QtWidgets.QWidget()
-        v = QtWidgets.QHBoxLayout(w)
-        left = QtWidgets.QWidget(maximumWidth=340)
-        fl = QtWidgets.QFormLayout(left)
-        self.cb_batload = self.R("bat_load", QtWidgets.QComboBox())
-        self.cb_batload.addItems(["Courant constant (A)", "Charge résistive (Ω)"])
-        self.ed_batval = self.R("bat_val", QtWidgets.QLineEdit("1"))
-        self.ed_batcut = self.R("bat_cut", QtWidgets.QLineEdit("10.5"))
-        self.bt_bat = QtWidgets.QPushButton("▶ Démarrer la décharge", checkable=True, toggled=self.toggle_battery)
-        self.lb_bat = QtWidgets.QLabel("Mesure en V DC aux bornes de la batterie.", wordWrap=True)
-        self.lb_bat.setFont(QtGui.QFont("Consolas", 10))
-        self.lb_bat.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        fl.addRow("Charge", self.cb_batload)
-        fl.addRow("Valeur", self.ed_batval)
-        fl.addRow("Coupure (V)", self.ed_batcut)
-        fl.addRow(self.bt_bat)
-        fl.addRow(QtWidgets.QPushButton("Mémoriser V à vide", clicked=self.bat_v0))
-        fl.addRow(QtWidgets.QPushButton("Calculer R interne (sous charge)", clicked=self.bat_rint))
-        fl.addRow(self.lb_bat)
-        v.addWidget(left)
-        self.bplot = self._plot()
-        self.bplot.setLabel("bottom", "Capacité", units="Ah")
-        self.bplot.setLabel("left", "Tension", units="V")
-        self.bcurve = self.bplot.plot(pen=pg.mkPen("#ffb74c", width=2))
-        v.addWidget(self.bplot, 1)
-        self.tabs.addTab(w, "Batterie")
-
-    def _tab_conso(self):
-        w = QtWidgets.QWidget()
-        v = QtWidgets.QHBoxLayout(w)
-        left = QtWidgets.QWidget(maximumWidth=360)
-        fl = QtWidgets.QFormLayout(left)
-        self.ed_cthr = self.R("cons_thr", QtWidgets.QLineEdit("1m"))
-        self.ed_ccap = self.R("cons_cap", QtWidgets.QLineEdit("2000"))
-        self.ck_clive = self.R("cons_live", QtWidgets.QCheckBox("Analyse continue"))
-        hb = QtWidgets.QHBoxLayout()
-        hb.addWidget(self.ed_cthr)
-        hb.addWidget(QtWidgets.QPushButton("Auto", clicked=self.cons_auto))
-        fl.addRow("Seuil veille/réveil (A)", hb)
-        fl.addRow("Capacité batterie (mAh)", self.ed_ccap)
-        fl.addRow(self.ck_clive)
-        fl.addRow(QtWidgets.QPushButton("Analyser la fenêtre du graphique", clicked=self.cons_analyse))
-        self.lb_cons = QtWidgets.QLabel("Mesure en A DC, sur la fenêtre affichée dans l'onglet Graphique.", wordWrap=True)
-        self.lb_cons.setFont(QtGui.QFont("Consolas", 10))
-        self.lb_cons.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        fl.addRow(self.lb_cons)
-        v.addWidget(left)
-        self.cplot_c = self._plot(axisItems={"bottom": pg.DateAxisItem()})
-        self.cplot_c.setLogMode(y=False)
-        self.ccurve = self.cplot_c.plot(pen=pg.mkPen("#7ad7ff", width=1.2))
-        self.cthr_line = pg.InfiniteLine(angle=0, pen=pg.mkPen("#ffb000", style=Qt.DashLine))
-        self.cplot_c.addItem(self.cthr_line)
-        v.addWidget(self.cplot_c, 1)
-        self.tabs.addTab(w, "Consommation")
-
-    def _tab_compare(self):
-        w = QtWidgets.QWidget()
-        v = QtWidgets.QHBoxLayout(w)
-        left = QtWidgets.QWidget(maximumWidth=300)
-        lv = QtWidgets.QVBoxLayout(left)
-        self.lw_traces = QtWidgets.QListWidget()
-        self.lw_traces.itemChanged.connect(lambda _: self.draw_compare())
-        lv.addWidget(QtWidgets.QPushButton("Charger CSV…", clicked=self.load_traces))
-        lv.addWidget(QtWidgets.QPushButton("Ajouter la session courante", clicked=self.add_current_trace))
-        lv.addWidget(self.lw_traces)
-        lv.addWidget(QtWidgets.QPushButton("Supprimer la sélection", clicked=self.remove_trace))
-        v.addWidget(left)
-        self.cmpplot = self._plot()
-        self.cmpplot.setLabel("bottom", "Temps", units="s")
-        self.cmpplot.addLegend()
-        v.addWidget(self.cmpplot, 1)
-        self.tabs.addTab(w, "Comparaison")
-
-    def _tab_seq(self):
-        w = QtWidgets.QWidget()
-        v = QtWidgets.QVBoxLayout(w)
-        hb = QtWidgets.QHBoxLayout()
-        self.bt_seqrun = QtWidgets.QPushButton("▶ Exécuter", clicked=self.seq_run)
-        self.bt_seqstop = QtWidgets.QPushButton("■ Arrêter", clicked=lambda: self.seq.stop())
-        self.lb_verdict = QtWidgets.QLabel("")
-        self.lb_verdict.setFont(QtGui.QFont("Segoe UI", 14, QtGui.QFont.Bold))
-        for x in (self.bt_seqrun, self.bt_seqstop, QtWidgets.QPushButton("Ouvrir…", clicked=self.seq_load),
-                  QtWidgets.QPushButton("Enregistrer…", clicked=self.seq_save),
-                  QtWidgets.QPushButton("Exemple", clicked=lambda: self.ed_seq.setPlainText(EXAMPLE)),
-                  QtWidgets.QPushButton("Aide", clicked=lambda: QtWidgets.QMessageBox.information(self, "Séquences", HELP))):
-            hb.addWidget(x)
-        hb.addStretch()
-        hb.addWidget(self.lb_verdict)
-        v.addLayout(hb)
-        sp = QtWidgets.QSplitter()
-        self.ed_seq = QtWidgets.QPlainTextEdit()
-        self.ed_seq.setFont(QtGui.QFont("Consolas", 10))
-        self.ed_seq.setPlainText(self.cfg.value("seq_text", EXAMPLE))
-        self.seq_out = QtWidgets.QPlainTextEdit(readOnly=True)
-        self.seq_out.setFont(QtGui.QFont("Consolas", 10))
-        sp.addWidget(self.ed_seq)
-        sp.addWidget(self.seq_out)
-        v.addWidget(sp)
-        self.tabs.addTab(w, "Séquences")
-
-    def _tab_console(self):
-        w = QtWidgets.QWidget()
-        v = QtWidgets.QVBoxLayout(w)
-        self.con_out = QtWidgets.QPlainTextEdit(readOnly=True)
-        self.con_out.setFont(QtGui.QFont("Consolas", 10))
-        self.con_in = QtWidgets.QLineEdit(placeholderText="Commande SCPI (ex. FUNC?, RANGE?, CALC:AVER:ALL?) + Entrée")
-        self.con_in.returnPressed.connect(self.console_send)
-        self.con_hist, self.con_hi = [], 0
-        self.con_in.installEventFilter(self)
-        v.addWidget(self.con_out)
-        v.addWidget(self.con_in)
-        self.tabs.addTab(w, "Console SCPI")
+        g.setRowStretch(3, 1)
+        return sa
 
     def _shortcuts(self):
         for key, fn in (("H", lambda: self.bt_hold.toggle()), ("R", lambda: self.bt_rel.toggle()),
@@ -661,6 +966,240 @@ class Main(QtWidgets.QMainWindow):
                         ("C", self.copy_value), ("A", self.autoscale)):
             sc = QtGui.QShortcut(QtGui.QKeySequence(key), self)
             sc.activated.connect(fn)
+
+    # ================================================================== navigation / thème / disposition
+    def goto(self, key):
+        self.section = key
+        self.stack.setCurrentIndex(self.pages[key])
+        self.nav_rail.select(key)
+        self.nav_tabs.select(key)
+        if key == "batt" or key == "conso":
+            self.refresh_views()
+
+    def set_option(self, k, v):
+        t = dict(self.theme_t)
+        t[k] = v
+        self.apply_theme(t, save=True)
+
+    def open_appearance(self):
+        AppearanceDialog(self, self.theme_t).exec()
+
+    def apply_theme(self, t, save=False):
+        self.theme_t = TH.complete(t)
+        t = self.theme_t
+        app = QtWidgets.QApplication.instance()
+        TH.apply(app, t)
+        skin, nav = t["skin"], t["nav"]
+        self.nav_rail.setVisible(nav == "rail")
+        self.tabsrow.setVisible(nav == "tabs")
+        self.disp.apply_theme(skin)
+        self.fpad.set_skin(skin)
+        self.range_sel.set_skin(skin)
+        self.func_card.setProperty("skin", skin)
+        self.func_card.style().unpolish(self.func_card)
+        self.func_card.style().polish(self.func_card)
+        for c in self.statsp.cards.values():
+            c.refont()
+        self.logo.setPixmap(TH.svg_pixmap(TH.ICONS["logo"], t["accent"], 26, stroke=2.2))
+        self.banner_icon.setPixmap(TH.svg_pixmap(TH.ICONS["layout"], t["sec"], 20))
+        self.bt_refresh.setIcon(TH.icon("refresh", t["text"], 16))
+        self.bt_theme.setIcon(TH.icon("palette", t["text"], 18))
+        self.bt_menu.setIcon(TH.icon("menu", t["text"], 18))
+        self.bt_layout.setIcon(TH.icon("layout", t["accent"] if self.edit_mode else t["text"], 16))
+        for a in self.skin_group.actions():
+            a.setChecked(a.data() == skin)
+        for a in self.nav_group.actions():
+            a.setChecked(a.data() == nav)
+        self._theme_plots()
+        if self.floating:
+            self.floating.refresh_theme()
+        self.disp_color = None
+        self.update_mode_label()
+        self.set_zoom(int(self.cfg.value("zoom", 100)), save=False)
+        if save:
+            self.cfg.setValue("theme_json", TH.to_json(t))
+
+    def _theme_plots(self):
+        t = self.theme_t
+        axis_pen = pg.mkPen(mix(t["grid"], t["muted"], 0.45))
+        for p in self.plots:
+            p.setBackground(t["plot"])
+            for ax in ("left", "bottom"):
+                p.getAxis(ax).setPen(axis_pen)
+                p.getAxis(ax).setTextPen(pg.mkPen(t["muted"]))
+        self.curve.setPen(pg.mkPen(t["curve"], width=t["curve_width"]))
+        for ln in (self.ln_lo, self.ln_hi):
+            ln.setPen(pg.mkPen(t["fail"], width=1.2, style=Qt.DashLine))
+        self.ln_mean.setPen(pg.mkPen(t["warn"], width=1.2, style=Qt.DotLine))
+        sc = QtGui.QColor(t["sec"])
+        sc.setAlpha(45)
+        self.region.setBrush(pg.mkBrush(sc))
+        self.bcurve.setPen(pg.mkPen(t["curve"], width=2))
+        self.ccurve.setPen(pg.mkPen(t["sec"], width=1.4))
+        self.cthr_line.setPen(pg.mkPen(t["warn"], style=Qt.DashLine))
+
+    def set_zoom(self, pct, save=True):
+        app = QtWidgets.QApplication.instance()
+        f = QtGui.QFont(TH.UI_FONT)
+        f.setPointSizeF(9.5 * pct / 100)
+        app.setFont(f)
+        for a in self.zoom_group.actions():
+            a.setChecked(a.data() == pct)
+        if save:
+            self.cfg.setValue("zoom", pct)
+
+    # ------------------------------------------------------------ disposition
+    def _dock_title(self, key):
+        d = self.docks[key]
+        if self.edit_mode or d.isFloating():
+            d.setTitleBarWidget(self.dock_titles[key])
+            self.dock_titles[key].show()
+            d.setFeatures(QtWidgets.QDockWidget.DockWidgetMovable | QtWidgets.QDockWidget.DockWidgetFloatable)
+        else:
+            self.dock_titles[key].hide()
+            d.setTitleBarWidget(QtWidgets.QWidget())
+            d.setFeatures(QtWidgets.QDockWidget.NoDockWidgetFeatures)
+
+    def _sync_dock_check(self, key):
+        ck = self.dock_checks.get(key)
+        if ck:
+            ck.blockSignals(True)
+            ck.setChecked(not self.docks[key].isHidden())
+            ck.blockSignals(False)
+
+    def set_edit_mode(self, on):
+        if on == self.edit_mode:
+            return
+        if on:
+            self._edit_snapshot = self.dockhost.saveState(LAYOUT_VERSION)
+            self.goto("mesure")
+        self.edit_mode = on
+        for key, d in self.docks.items():
+            self._dock_title(key)
+            w = d.widget()
+            w.setProperty("edit", on)
+            w.style().unpolish(w)
+            w.style().polish(w)
+            self._sync_dock_check(key)
+        self.banner.setVisible(on)
+        self.side.setVisible(on)
+        self.bt_layout.blockSignals(True)
+        self.bt_layout.setChecked(on)
+        self.bt_layout.blockSignals(False)
+        self.bt_layout.setIcon(TH.icon("layout", self.theme_t["accent"] if on else self.theme_t["text"], 16))
+        (self.title_timer.start if on else self.title_timer.stop)()
+
+    def save_edit(self):
+        self.cfg.setValue("layout_state", bytes(self.dockhost.saveState(LAYOUT_VERSION).toBase64()).decode())
+        self.set_edit_mode(False)
+        self.statusBar().showMessage("Disposition enregistrée", 3000)
+
+    def cancel_edit(self):
+        if getattr(self, "_edit_snapshot", None) is not None:
+            self.dockhost.restoreState(self._edit_snapshot, LAYOUT_VERSION)
+        self.set_edit_mode(False)
+
+    def custom_layouts(self):
+        try:
+            return json.loads(self.cfg.value("layout_custom", "{}"))
+        except (ValueError, TypeError):
+            return {}
+
+    def _refresh_presets(self):
+        while self.preset_grid.count():
+            it = self.preset_grid.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+        self.menu_layouts.clear()
+        names = list(LAYOUTS) + list(self.custom_layouts())
+        for i, name in enumerate(names):
+            b = PresetButton(name, LAYOUTS.get(name, [(0, 0, 1, 1, 0)]))
+            b.setCheckable(False)
+            b.clicked.connect(lambda _=False, n=name: self.apply_layout(n))
+            self.preset_grid.addWidget(b, i // 2, i % 2)
+            self.menu_layouts.addAction(name, lambda n=name: self.apply_layout(n))
+        self.menu_layouts.addSeparator()
+        self.menu_layouts.addAction("Modifier la disposition…", lambda: self.set_edit_mode(True))
+
+    def save_layout_as(self):
+        name, ok = QtWidgets.QInputDialog.getText(self, "Disposition", "Nom de la disposition :")
+        if ok and name.strip() and name.strip() not in LAYOUTS:
+            c = self.custom_layouts()
+            c[name.strip()] = bytes(self.dockhost.saveState(LAYOUT_VERSION).toBase64()).decode()
+            self.cfg.setValue("layout_custom", json.dumps(c))
+            self._refresh_presets()
+
+    def delete_layout(self):
+        c = self.custom_layouts()
+        if not c:
+            return
+        name, ok = QtWidgets.QInputDialog.getItem(self, "Disposition", "Supprimer :", sorted(c), 0, False)
+        if ok:
+            c.pop(name, None)
+            self.cfg.setValue("layout_custom", json.dumps(c))
+            self._refresh_presets()
+
+    def apply_layout(self, name):
+        host, D = self.dockhost, self.docks
+        custom = self.custom_layouts()
+        if name in custom:
+            host.restoreState(QtCore.QByteArray.fromBase64(custom[name].encode()), LAYOUT_VERSION)
+            return
+        for d in D.values():
+            d.setFloating(False)
+            host.removeDockWidget(d)
+        H, V = Qt.Horizontal, Qt.Vertical
+        L, T, B = Qt.LeftDockWidgetArea, Qt.TopDockWidgetArea, Qt.BottomDockWidgetArea
+        if name == "Grand afficheur":
+            show = ["display", "actions", "stats", "chart"]
+            host.addDockWidget(T, D["display"])
+            host.splitDockWidget(D["display"], D["actions"], V)
+            host.splitDockWidget(D["actions"], D["stats"], V)
+            host.splitDockWidget(D["stats"], D["chart"], V)
+            sizes = [(["display", "actions", "stats", "chart"], [460, 48, 76, 280], V)]
+        elif name == "Analyse":
+            show = ["display", "actions", "stats", "chart"]
+            host.addDockWidget(T, D["display"])
+            host.splitDockWidget(D["display"], D["stats"], H)
+            host.splitDockWidget(D["display"], D["actions"], V)
+            host.addDockWidget(B, D["chart"])
+            sizes = [(["display", "stats"], [760, 600], H), (["display", "chart"], [210, 560], V)]
+        elif name == "Compact":
+            show = ["display", "actions"]
+            host.addDockWidget(T, D["display"])
+            host.splitDockWidget(D["display"], D["actions"], V)
+            sizes = [(["display", "actions"], [640, 48], V)]
+        else:
+            show = [k for k, _ in DOCKS]
+            host.addDockWidget(L, D["function"])
+            host.splitDockWidget(D["function"], D["display"], H)
+            host.splitDockWidget(D["function"], D["limits"], V)
+            host.splitDockWidget(D["display"], D["actions"], V)
+            host.splitDockWidget(D["actions"], D["stats"], V)
+            host.splitDockWidget(D["stats"], D["chart"], V)
+            sizes = [(["function", "display"], [360, 1080], H), (["display", "actions", "stats", "chart"], [250, 48, 76, 430], V),
+                     (["function", "limits"], [560, 250], V)]
+        for k, d in D.items():
+            d.setVisible(k in show)
+            self._sync_dock_check(k)
+
+        def resize():
+            for keys, px, orient in sizes:
+                host.resizeDocks([D[k] for k in keys], px, orient)
+        QtCore.QTimer.singleShot(0, resize)
+
+    def toggle_compact(self):
+        if self.act_compact.isChecked():
+            self.compact_state = self.dockhost.saveState(LAYOUT_VERSION)
+            self.apply_layout("Compact")
+            self.nav_rail.hide()
+            self.tabsrow.hide()
+            self.goto("mesure")
+        else:
+            if self.compact_state is not None:
+                self.dockhost.restoreState(self.compact_state, LAYOUT_VERSION)
+            self.nav_rail.setVisible(self.theme_t["nav"] == "rail")
+            self.tabsrow.setVisible(self.theme_t["nav"] == "tabs")
 
     # ================================================================== réglages / profils
     def _load_settings(self):
@@ -670,13 +1209,12 @@ class Main(QtWidgets.QMainWindow):
         self.act_fast.setChecked(b("fast", True))
         self.act_restore.setChecked(b("restore", True))
         self.act_rangecmd.setChecked(b("rangecmd", True))
+        self.act_autoupd.setChecked(b("autoupd", True))
         self.ck_csvfr.setChecked(b("csvfr", True))
         self.ck_beep.blockSignals(True)
         self.ck_beep.setChecked(b("beep", True))
         self.ck_beep.blockSignals(False)
         self.sp_webport.setValue(int(c.value("web_port", 8088)))
-        self.act_light.setChecked(self.theme == "light")
-        self.set_zoom(int(c.value("zoom", 100)), save=False)
         g = c.value("geom")
         if g:
             self.restoreGeometry(g)
@@ -688,15 +1226,16 @@ class Main(QtWidgets.QMainWindow):
     def _save_settings(self):
         c = self.cfg
         c.setValue("port", self.cb_port.currentData() or c.value("port", ""))
-        for k, a in (("autorec", self.act_autorec), ("fast", self.act_fast), ("restore", self.act_restore), ("rangecmd", self.act_rangecmd)):
+        for k, a in (("autorec", self.act_autorec), ("fast", self.act_fast), ("restore", self.act_restore), ("rangecmd", self.act_rangecmd), ("autoupd", self.act_autoupd)):
             c.setValue(k, "true" if a.isChecked() else "false")
         for k, w in (("csvfr", self.ck_csvfr), ("beep", self.ck_beep), ("web", self.ck_web), ("mqtt", self.ck_mqtt)):
             c.setValue(k, "true" if w.isChecked() else "false")
         c.setValue("web_port", self.sp_webport.value())
-        c.setValue("theme", self.theme)
         c.setValue("geom", self.saveGeometry())
         c.setValue("seq_text", self.ed_seq.toPlainText())
         c.setValue("last_state", json.dumps(self.get_state()))
+        if not self.edit_mode and not self.act_compact.isChecked():
+            c.setValue("layout_state", bytes(self.dockhost.saveState(LAYOUT_VERSION).toBase64()).decode())
 
     def get_state(self):
         st = {"mode": self.mode}
@@ -738,10 +1277,12 @@ class Main(QtWidgets.QMainWindow):
             except (ValueError, TypeError):
                 pass
             w.blockSignals(False)
+            w.update()
         self.filt = deque(maxlen=self.sp_avg.value())
         self.ah_buf = deque(maxlen=self.sp_ahn.value())
         if self.worker:
             self.worker.interval = self.sp_int.value() / 1000
+        self.win_seg.set_current(self.cb_win.currentIndex())
         self.update_limits()
         self.update_mode_label()
         if device and self.worker:
@@ -846,6 +1387,13 @@ class Main(QtWidgets.QMainWindow):
             self.cb_port.setCurrentIndex(found)
             self.statusBar().showMessage(f"XDM1041 trouvé sur {self.cb_port.itemData(found)}", 5000)
 
+    def _pill(self, text, state=None):
+        self.lb_idn.setText(text)
+        for prop in ("on", "lost"):
+            self.lb_idn.setProperty(prop, state == prop)
+        self.lb_idn.style().unpolish(self.lb_idn)
+        self.lb_idn.style().polish(self.lb_idn)
+
     def toggle_connect(self):
         if self.worker:
             self.disconnect_dmm()
@@ -879,9 +1427,11 @@ class Main(QtWidgets.QMainWindow):
 
     def on_connected(self, idn):
         self.idn = idn
-        self.lb_idn.setText(idn)
-        self.lb_idn.setStyleSheet("")
+        parts = idn.split(",")
+        self._pill(f"● {self.cb_port.currentText().split(' — ')[0]} · {parts[1] if len(parts) > 1 else 'XDM'} · {parts[3] if len(parts) > 3 else ''}".rstrip(" ·"), "on")
+        self.lb_idn.setToolTip(idn)
         self.bt_conn.setText("Déconnecter")
+        self.bt_conn.setChecked(False)
         self.bt_conn.setEnabled(True)
         self.log(f"<< {idn}")
         self.web.set(online=True)
@@ -911,8 +1461,7 @@ class Main(QtWidgets.QMainWindow):
         self.cmd(f"SYST:BEEP:STAT {'ON' if self.ck_beep.isChecked() else 'OFF'}")
 
     def on_lost(self, msg):
-        self.lb_idn.setText("⚠ " + msg)
-        self.lb_idn.setStyleSheet("color:#ffb000;")
+        self._pill("⚠ Liaison perdue — reconnexion…", "lost")
         self.statusBar().showMessage(msg, 5000)
         self.web.set(online=False)
         self.add_event("Liaison", None, msg)
@@ -925,9 +1474,8 @@ class Main(QtWidgets.QMainWindow):
             pass
         self.bt_conn.setText("Connecter")
         self.bt_conn.setEnabled(True)
-        self.lb_idn.setText("Déconnecté")
-        self.lb_idn.setStyleSheet("")
-        self.lb_rate.setText("")
+        self._pill("Déconnecté")
+        self.disp.set_rate("")
         self.web.set(online=False)
 
     def on_error(self, msg):
@@ -973,27 +1521,41 @@ class Main(QtWidgets.QMainWindow):
                 self.worker.dual = dual
         elif tag == "calc_all":
             self.log(f"Stats DMM (min, max, moy, n) : {r}")
-            self.tabs.setCurrentIndex(self.tabs.count() - 1)
+            self.goto("journal")
         elif tag == "console":
             self.log(f"<< {r}")
         elif tag == "seq":
             self.seq.on_reply(r)
 
     # ================================================================== commandes DMM
+    def on_func_pick(self, key):
+        if key == "AUTO":
+            if MODES[self.mode]["ranges"] and self.mode != "TEMP":
+                self.on_range_pick(0)
+        else:
+            self.set_mode(key)
+
+    def on_range_pick(self, i):
+        self.cb_range.setCurrentIndex(i)
+        self.set_range(i)
+
+    def on_speed_pick(self, i):
+        self.cb_speed.setCurrentIndex(i)
+        self.set_speed(i)
+
     def set_mode(self, key, send=True, clear=True):
         m = MODES[key]
         changed = key != self.mode
         self.mode = key
         self.unit_override = None
-        for b in self.fbtn.buttons():
-            b.setChecked(b.property("key") == key)
+        self.fpad.set_current(key)
         if changed or self.cb_range.count() != len(m["ranges"]):
             self.cb_range.blockSignals(True)
             self.cb_range.clear()
             for lab, _ in m["ranges"]:
                 self.cb_range.addItem(lab)
             self.cb_range.blockSignals(False)
-        self.cb_range.setEnabled(bool(m["ranges"]))
+            self.range_sel.set_items([lab for lab, _ in m["ranges"]])
         self.ck_dual.setEnabled(bool(m.get("dual")))
         if not m.get("dual") and self.worker:
             self.worker.dual = False
@@ -1016,16 +1578,14 @@ class Main(QtWidgets.QMainWindow):
         lab = label.strip().upper().replace(" ", "")
         for i, (l, val) in enumerate(m["ranges"]):
             if lab in (l.upper().replace(" ", ""), val.upper()):
-                self.cb_range.setCurrentIndex(i)
-                self.set_range(i)
+                self.on_range_pick(i)
                 return True
         x = try_si(label)
         if x is not None:
             for i, (_, val) in enumerate(m["ranges"]):
                 vv = try_si(val)
                 if vv and abs(vv - x) / vv < 1e-6:
-                    self.cb_range.setCurrentIndex(i)
-                    self.set_range(i)
+                    self.on_range_pick(i)
                     return True
         return False
 
@@ -1039,12 +1599,27 @@ class Main(QtWidgets.QMainWindow):
     def noprefix(self):
         return bool(self.unit_override) or MODES[self.mode].get("noprefix", False)
 
+    def mode_chips(self):
+        chips = [MODES[self.mode]["label"]]
+        if self.cb_range.count():
+            chips.append(self.cb_range.currentText())
+        chips.append(self.cb_speed.currentText().split(" (")[0])
+        if self.sp_avg.value() > 1:
+            chips.append(f"AVG {self.sp_avg.value()}")
+        if self.cb_math.currentIndex():
+            chips.append(self.cb_math.currentText().split(" (")[0])
+        return chips
+
+    def mode_text(self):
+        return "   ".join(self.mode_chips())
+
     def update_mode_label(self):
-        rng = self.cb_range.currentText() if self.cb_range.count() else ""
-        self.lb_mode.setText(f"{MODES[self.mode]['label']}   {rng}   {self.cb_speed.currentText()}")
+        self.disp.set_chips(self.mode_chips())
+        if self.cb_range.count():
+            self.range_sel.set_current(max(0, self.cb_range.currentIndex()))
+        self.speed_seg.set_current(self.cb_speed.currentIndex())
         u = self.unit()
-        for p in (self.plot, self.hplot):
-            ax = "left" if p is self.plot else "bottom"
+        for p, ax in ((self.plot, "left"), (self.hplot, "bottom")):
             if self.noprefix():
                 p.setLabel(ax, u)
             else:
@@ -1078,14 +1653,15 @@ class Main(QtWidgets.QMainWindow):
         if self.worker:
             self.worker.dual = on
         if not on:
-            self.lb_sec.setText("")
+            self.disp.set_secondary("")
 
     def set_tunit(self, _):
         self.cmd(f"TEMP:RTD:UNIT {self.cb_tunit.currentText()}")
         self.update_mode_label()
 
     def toggle_run(self, paused):
-        self.bt_run.setText("▶ Reprendre acquisition" if paused else "⏸ Pause acquisition")
+        self.bt_run.icon_name = "play" if paused else "pause"
+        self.bt_run.update()
         if self.worker:
             self.worker.polling = not paused
 
@@ -1142,7 +1718,7 @@ class Main(QtWidgets.QMainWindow):
         return fmt_si(v, self.unit(), sig or self.sp_dig.value(), self.noprefix())
 
     def copy_value(self):
-        QtWidgets.QApplication.clipboard().setText(self.lb_main.text())
+        QtWidgets.QApplication.clipboard().setText(self.disp_text)
 
     def toggle_rel(self, on):
         self.rel = self.last_v if on and self.last_v is not None and math.isfinite(self.last_v) else None
@@ -1150,7 +1726,8 @@ class Main(QtWidgets.QMainWindow):
             self.bt_rel.blockSignals(True)
             self.bt_rel.setChecked(False)
             self.bt_rel.blockSignals(False)
-        self.bt_rel.setText(f"REL Δ ({self.fmt(self.rel, 5)})" if self.rel is not None else "REL Δ (R)")
+        self.bt_rel.setText(f"REL Δ {self.fmt(self.rel, 5)}" if self.rel is not None else "REL Δ")
+        self.bt_rel.updateGeometry()
         self.clear_data()
 
     def clear_data(self):
@@ -1190,9 +1767,12 @@ class Main(QtWidgets.QMainWindow):
                 ln.show()
             else:
                 ln.hide()
-        if not on:
-            self.lb_pf.setText("")
-            self.lb_pf.setStyleSheet("")
+        if on and (self.lo is not None or self.hi is not None):
+            f = lambda x: self.fmt(x, 4) if x is not None else "…"
+            self.lb_limrange.setText(f"{f(self.lo)} … {f(self.hi)}")
+        else:
+            self.lb_limrange.setText("Limites désactivées")
+            self.disp.set_pf(None)
 
     def eval_limits(self, v):
         if not self.ck_lim.isChecked() or (self.lo is None and self.hi is None):
@@ -1221,15 +1801,15 @@ class Main(QtWidgets.QMainWindow):
             self._refresh_bins()
         items = [str(r + 1), datetime.datetime.now().strftime("%H:%M:%S"), self.fmt(v),
                  f"{v:.9g}" if raw is None else f"{raw:.9g}", st, bac, dev]
+        bad = st == "FAIL" or bac.startswith("Hors")
         for c, t in enumerate(items):
             it = QtWidgets.QTableWidgetItem(t)
-            if st or bac.startswith("Hors"):
-                bad = st == "FAIL" or bac.startswith("Hors")
-                it.setForeground(QtGui.QColor("#ff5050" if bad else "#2fbf5f"))
+            if st or bac:
+                it.setForeground(QtGui.QColor(self.theme_t["fail"] if bad else self.theme_t["pass_"]))
             self.tbl.setItem(r, c, it)
         self.tbl.scrollToBottom()
-        bad = st == "FAIL" or bac.startswith("Hors")
         self.beep("fail" if bad else "ok")
+        self.statusBar().showMessage(f"Capture n° {r + 1} : {self.fmt(v)} {bac}", 3000)
         tts = self.cb_tts.currentIndex()
         if tts in (2, 4):
             txt = speak_si(v, self.unit(), 4, self.noprefix())
@@ -1246,7 +1826,7 @@ class Main(QtWidgets.QMainWindow):
             v = try_si(k.split(" ")[0])
             return (0, v) if v is not None else (1, 0)
 
-        for k in sorted(self.bins, key=lambda k: key(k)):
+        for k in sorted(self.bins, key=key):
             r = self.tbl_bins.rowCount()
             self.tbl_bins.insertRow(r)
             self.tbl_bins.setItem(r, 0, QtWidgets.QTableWidgetItem(k))
@@ -1282,7 +1862,16 @@ class Main(QtWidgets.QMainWindow):
                                self.fmt(v) if v is not None else "", msg)):
             self.tbl_ev.setItem(r, c, QtWidgets.QTableWidgetItem(t))
         self.tbl_ev.scrollToBottom()
-        self.tabs.setTabText(3, f"Événements ({r + 1})")
+        self.n_events = r + 1
+        b = str(self.n_events) if self.n_events < 100 else "99+"
+        self.nav_rail.set_badge("journal", b)
+        self.nav_tabs.set_badge("journal", b)
+
+    def clear_events(self):
+        self.tbl_ev.setRowCount(0)
+        self.n_events = 0
+        self.nav_rail.set_badge("journal", "")
+        self.nav_tabs.set_badge("journal", "")
 
     def anomaly(self, t, v):
         if not self.ck_an.isChecked():
@@ -1298,6 +1887,17 @@ class Main(QtWidgets.QMainWindow):
                     self.speaker.say(f"Alerte {kind}")
 
     # ================================================================== mesures
+    def bar_info(self, v):
+        if not math.isfinite(v) or self.mode in ("TEMP", "CONT") or self.unit_override:
+            return None, ""
+        m = MODES[self.mode]
+        idx = self.cb_range.currentIndex()
+        fs = try_si(m["ranges"][idx][1]) if m["ranges"] and idx > 0 else None
+        fs = fs or auto_full_scale(v)
+        if not fs:
+            return 0.0, ""
+        return min(1.0, abs(v) / fs), fmt_si(fs, self.unit(), 3, self.noprefix()).replace(".00 ", " ").replace(".0 ", " ")
+
     def on_reading(self, t, v, s):
         self.rate_ts.append(t)
         if t < self.ignore_until:
@@ -1323,47 +1923,53 @@ class Main(QtWidgets.QMainWindow):
             if pf != self.pf:
                 self.npass += pf == "PASS"
                 self.nfail += pf == "FAIL"
-            self.pf = pf
-            self.lb_pf.setText(pf)
-            self.lb_pf.setStyleSheet(f"color:#05080a;background:{'#4cff7a' if pf == 'PASS' else '#ff5050'};border-radius:6px;padding:2px 10px;")
-        else:
-            self.pf = None
+        self.pf = pf
         self.autohold(v)
         self.rec_process(t, v, raw, s, pf)
         self.anomaly(t, v)
         if self.battery.running and self.battery.feed(t, raw):
             self.battery_done()
         self.seq.on_reading(v)
-        color = "#4cff7a"
+        th = self.theme_t
+        color = None
         if not self.hold:
             self.filt.append(v)
             fin = [x for x in self.filt if math.isfinite(x)]
             dv = (sum(fin) / len(fin)) if fin and len(fin) == len(self.filt) else v
-            self.disp_text = self.fmt(dv)
-            self.lb_main.setText(self.disp_text)
+            num, u = fmt_parts(dv, self.unit(), self.sp_dig.value(), self.noprefix())
+            self.disp_text = f"{num} {u}"
+            if self.mode == "CONT" and math.isfinite(v) and v <= try_si(self.ed_cont.text(), 50):
+                color = th["warn"]
+            elif pf and th["pf_color"]:
+                color = th["pass_"] if pf == "PASS" else th["fail"]
+            self.disp_color = color
+            self.disp.set_value(num, u, color)
+            self.disp.set_pf(pf)
             if s is not None:
-                self.lb_sec.setText(fmt_si(s, "Hz", 6))
-            if self.mode == "CONT" and math.isfinite(v):
-                if v <= try_si(self.ed_cont.text(), 50):
-                    color = "#ffd84c"
-            self.lb_main.setStyleSheet(f"color:{color};")
+                self.disp.set_secondary(fmt_si(s, "Hz", 6))
+            frac, sc = self.bar_info(dv)
+            self.disp.set_bar(frac, sc)
+        self.disp.set_annunciators({
+            "AUTO": self.cb_range.count() > 0 and self.cb_range.currentIndex() == 0 and self.mode != "TEMP",
+            "HOLD": self.hold, "REL": self.rel is not None, "AVG": self.sp_avg.value() > 1,
+            "MATH": self.cb_math.currentIndex() in (1, 4), "dB": self.cb_math.currentIndex() in (2, 3),
+            "2ND": s is not None, "REC": self.rec_state == "rec", "RMT": self.worker is not None})
         sec_txt = fmt_si(s, "Hz", 6) if s is not None else ""
         if self.floating:
-            self.floating.update_view(self.disp_text, self.lb_mode.text(), sec_txt, pf, color)
+            self.floating.update_view(self.disp_text, self.mode_text(), sec_txt, pf, self.disp_color)
         if self.ck_web.isChecked():
             S = self.stats
             st = f"N {S.n}  min {self.fmt(S.min, 5)}  max {self.fmt(S.max, 5)}  moy {self.fmt(S.mean, 5)}" if S.n else ""
-            self.web.update(t, v, display=self.disp_text, unit=self.unit(), mode=self.lb_mode.text(), sec=sec_txt,
+            self.web.update(t, v, display=self.disp_text, unit=self.unit(), mode=self.mode_text(), sec=sec_txt,
                             pf=pf or "", stats=st, online=True)
         if self.ck_mqtt.isChecked():
             self.mqtt.publish(t, v, self.unit(), MODES[self.mode]["label"], pf, s, self.disp_text)
-        flags = [f for f, on in (("HOLD", self.hold), ("REL", self.rel is not None), ("MATH", self.cb_math.currentIndex()),
-                                 ("● REC", self.rec_state == "rec"), ("◌ ARMÉ", self.rec_state == "armed"),
-                                 (f"AVG{self.sp_avg.value()}", self.sp_avg.value() > 1), ("BATT", self.battery.running),
-                                 ("SEQ", self.seq.running), ("WEB", self.ck_web.isChecked()), ("MQTT", self.ck_mqtt.isChecked())) if on]
-        self.lb_flags.setText("  ".join(flags))
 
     # ================================================================== enregistrement
+    def _rec_clicked(self):
+        self.bt_rec.toggle()
+        self.act_rec.setChecked(self.bt_rec.isChecked())
+
     def toggle_rec(self, on):
         if on:
             fn, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Enregistrer sous", f"XDM1041_{datetime.datetime.now():%Y%m%d_%H%M%S}.csv", "CSV (*.csv)")
@@ -1371,6 +1977,7 @@ class Main(QtWidgets.QMainWindow):
                 self.bt_rec.blockSignals(True)
                 self.bt_rec.setChecked(False)
                 self.bt_rec.blockSignals(False)
+                self.act_rec.setChecked(False)
                 return
             self.rec_file = open(fn, "w", newline="", encoding="utf-8-sig")
             self.rec_writer = csv.writer(self.rec_file, delimiter=";" if self.ck_csvfr.isChecked() else ",")
@@ -1382,6 +1989,7 @@ class Main(QtWidgets.QMainWindow):
                 self._rec_start(time.time())
             else:
                 self.rec_state = "armed"
+                self.act_rec.setText("Armé")
                 if trig == 3:
                     now = datetime.datetime.now()
                     tt = self.te_trig.time()
@@ -1392,18 +2000,22 @@ class Main(QtWidgets.QMainWindow):
                     self.lb_rec.setText(f"Armé : départ à {tgt:%H:%M:%S}\n{fn}")
                 else:
                     self.lb_rec.setText(f"Armé : {self.cb_trig.currentText().lower()} {self.ed_trigthr.text()}\n{fn}")
-            self.bt_rec.setText("■ Arrêter")
+            self.bt_rec.setText("Arrêter")
         else:
             if self.rec_file:
                 self.rec_file.close()
             self.rec_file = self.rec_writer = None
             self.rec_state = None
-            self.bt_rec.setText("● Démarrer / armer")
+            self.bt_rec.setText("Démarrer / armer")
+            self.act_rec.setText("Enregistrer")
             self.lb_rec.setText(f"Terminé — {self.rec_count} lignes")
+        self.act_rec.setChecked(self.bt_rec.isChecked())
+        self.act_rec.updateGeometry()
 
     def _rec_start(self, t):
         self.rec_state = "rec"
         self.rec_t0 = t
+        self.act_rec.setText("REC")
         self.lb_rec.setText(f"Enregistrement…\n{self.rec_fn}")
         if self.cb_trig.currentIndex():
             self.beep("ok")
@@ -1447,17 +2059,17 @@ class Main(QtWidgets.QMainWindow):
             if self.mode != "VDC":
                 self.set_mode("VDC")
             self.battery.start(self.cb_batload.currentIndex(), val, cut)
-            self.bt_bat.setText("■ Arrêter la décharge")
+            self.bt_bat.setText("Arrêter la décharge")
             self.add_event("Batterie", self.last_v, "début de décharge")
         else:
             self.battery.running = False
-            self.bt_bat.setText("▶ Démarrer la décharge")
+            self.bt_bat.setText("Démarrer la décharge")
 
     def battery_done(self):
         self.bt_bat.blockSignals(True)
         self.bt_bat.setChecked(False)
         self.bt_bat.blockSignals(False)
-        self.bt_bat.setText("▶ Démarrer la décharge")
+        self.bt_bat.setText("Démarrer la décharge")
         self.add_event("Batterie", self.last_v, f"fin : {self.battery.done_reason}")
         self.beep("fail")
         self.speaker.say("Décharge terminée, " + speak_si(self.battery.ah, "Ah", 3).replace("Ah", "ampères heure"))
@@ -1493,8 +2105,8 @@ class Main(QtWidgets.QMainWindow):
         cap = try_si(self.ed_ccap.text())
         aut = ""
         if cap and r["avg"] > 0:
-            h = cap / 1000 / r["avg"]
-            aut = f"\nAutonomie estimée : {h:,.1f} h  ({h / 24:,.1f} j)".replace(",", " ")
+            hh = cap / 1000 / r["avg"]
+            aut = f"\nAutonomie estimée : {hh:,.1f} h  ({hh / 24:,.1f} j)".replace(",", " ")
         per = f"{r['period']:.2f} s" if math.isfinite(r["period"]) else "—"
         wd = f"{r['wake_dur'] * 1000:.1f} ms" if math.isfinite(r["wake_dur"]) else "—"
         self.lb_cons.setText(
@@ -1506,8 +2118,9 @@ class Main(QtWidgets.QMainWindow):
     def toggle_region(self, on):
         if on and self.view_t.size > 1:
             t0, t1 = self.view_t[0], self.view_t[-1]
-            self.region.setRegion((t0 + (t1 - t0) * 0.6, t1 - (t1 - t0) * 0.1))
+            self.region.setRegion((t0 + (t1 - t0) * 0.5, t1))
         self.region.setVisible(on)
+        self.lb_region.setVisible(on)
         self.lb_region.setText("")
         if on:
             self.ck_chartpause.setChecked(True)
@@ -1537,37 +2150,46 @@ class Main(QtWidgets.QMainWindow):
         now = time.time()
         while self.rate_ts and now - self.rate_ts[0] > 2:
             self.rate_ts.popleft()
-        if self.worker:
-            self.lb_rate.setText(f"{len(self.rate_ts) / 2:.1f} mes/s")
+        self.disp.set_rate(f"{len(self.rate_ts) / 2:.1f} mes/s".replace(".", ",") if self.worker else "")
         u, npf, dg = self.unit(), self.noprefix(), self.sp_dig.value()
         f = lambda x: fmt_si(x, u, dg, npf)
         S = self.stats
         if S.n:
-            for k, val in (("N", str(S.n)), ("Min", f(S.min)), ("Max", f(S.max)), ("Moyenne", f(S.mean)), ("σ", f(S.std)),
-                           ("Crête-crête", f(S.max - S.min)), ("σ / moy", f"{100 * S.std / abs(S.mean):.4f} %" if S.mean else "—")):
+            for k, val in (("N", f"{S.n:,}".replace(",", " ")), ("Min", f(S.min)), ("Max", f(S.max)), ("Moyenne", f(S.mean)),
+                           ("σ", f(S.std)), ("Crête-crête", f(S.max - S.min)),
+                           ("σ / moy", f"{100 * S.std / abs(S.mean):.4f} %" if S.mean else "—")):
                 self.st[k].setText(val)
+            if self.theme_t["skin"] == "instrument":
+                g = lambda x: fmt_si(x, u, 6, npf)
+                self.disp.set_statsline(f"MIN {g(S.min)}    MOY {g(S.mean)}    MAX {g(S.max)}    σ {fmt_si(S.std, u, 3, npf)}")
         else:
             for k in self.st:
                 self.st[k].setText("—")
-        self.st["PASS / FAIL"].setText(f"{self.npass} / {self.nfail}")
+            self.disp.set_statsline("")
+        self.st_pf.setText(f"PASS {self.npass} · FAIL {self.nfail}")
+        extra = []
+        if self.rel is not None:
+            extra.append(f"REL réf. {self.fmt(self.rel, 5)}")
+        if self.ck_bin.isChecked() and self.last_v is not None and math.isfinite(self.last_v) and self.mode in ("RES", "CAP"):
+            nom, d = nearest_e(abs(self.last_v), self.cb_bin.currentText())
+            if nom:
+                extra.append(f"Bac {self.cb_bin.currentText()} : {fmt_si(nom, u, 3, npf)} · écart {d:+.2f} %")
+        self.disp.set_extra("   ·   ".join(extra))
         h = self.integ / 3600
         if self.mode in ("IDC", "IAC"):
             volt = try_si(self.ed_volt.text(), 0.0)
-            self.lb_integ.setText(f"Q = {fmt_si(h, 'Ah', 6)}   ({fmt_si(self.integ, 'C', 6)})\nE ≈ {fmt_si(h * volt, 'Wh', 6)} @ {volt:g} V")
+            self.lb_integ.setText(f"Q = {fmt_si(h, 'Ah', 6)}\n    ({fmt_si(self.integ, 'C', 6)})\nE ≈ {fmt_si(h * volt, 'Wh', 6)} @ {volt:g} V")
         else:
-            self.lb_integ.setText(f"∫ = {fmt_si(self.integ, u + '·s', 6, npf)}  /  {fmt_si(h, u + '·h', 6, npf)}")
-        # déclencheur horaire / durée
+            self.lb_integ.setText(f"∫ = {fmt_si(self.integ, u + '·s', 6, npf)}\n  = {fmt_si(h, u + '·h', 6, npf)}")
         if self.rec_state == "armed" and self.cb_trig.currentIndex() == 3 and self.rec_target and now >= self.rec_target:
             self._rec_start(now)
         if self.rec_state == "rec" and self.sp_recdur.value() and now - self.rec_t0 >= self.sp_recdur.value():
             self.bt_rec.setChecked(False)
-        # annonce périodique
         if self.cb_tts.currentIndex() == 1 and self.worker and now - self.tts_last >= self.sp_tts.value() and self.last_v is not None:
             self.tts_last = now
             self.speaker.say(speak_si(self.last_v - (self.rel or 0), u, 4, npf))
-        # batterie
         B = self.battery
-        if B.pts and (B.running or self.tabs.currentIndex() == 4):
+        if B.pts and (B.running or self.section == "batt"):
             a = np.array(B.pts)
             self.bcurve.setData(a[:, 1], a[:, 2])
             el = a[-1, 0]
@@ -1594,23 +2216,28 @@ class Main(QtWidgets.QMainWindow):
             t, y = t[i0:], y[i0:]
         self.view_t, self.view_y = t, y
         yp = np.where(np.isfinite(y), y, np.nan)
-        self.curve.setData(t, yp, connect="finite")
-        if self.ck_mean.isChecked() and S.n:
-            self.ln_mean.setValue(S.mean)
-            self.ln_mean.show()
-        else:
-            self.ln_mean.hide()
-        tab = self.tabs.currentIndex()
-        if tab == 1:
-            yf = y[np.isfinite(y)]
-            self.hplot.clear()
-            if yf.size > 1 and yf.max() > yf.min():
-                cnt, edges = np.histogram(yf, bins=self.sp_bins.value())
-                self.hplot.addItem(pg.BarGraphItem(x0=edges[:-1], x1=edges[1:], height=cnt, brush="#4cff7a88", pen=self.colors["curve"]))
-        elif tab == 5:
+        if self.section == "mesure":
+            self.curve.setData(t, yp, connect="finite")
+            if self.ck_mean.isChecked() and S.n:
+                self.ln_mean.setValue(S.mean)
+                self.ln_mean.show()
+            else:
+                self.ln_mean.hide()
+            if self.chart_stack.currentIndex() == 1:
+                self._draw_hist(y)
+        elif self.section == "conso":
             self.ccurve.setData(t, yp, connect="finite")
             if self.ck_clive.isChecked() and int(now * 2) % 4 == 0:
                 self.cons_analyse()
+
+    def _draw_hist(self, y):
+        yf = y[np.isfinite(y)]
+        self.hplot.clear()
+        if yf.size > 1 and yf.max() > yf.min():
+            cnt, edges = np.histogram(yf, bins=self.sp_bins.value())
+            c = QtGui.QColor(self.theme_t["curve"])
+            c.setAlpha(140)
+            self.hplot.addItem(pg.BarGraphItem(x0=edges[:-1], x1=edges[1:], height=cnt, brush=c, pen=self.theme_t["curve"]))
 
     # ================================================================== comparaison
     def _read_trace(self, path):
@@ -1674,7 +2301,7 @@ class Main(QtWidgets.QMainWindow):
         it.setCheckState(Qt.Checked)
         it.setForeground(QtGui.QColor(TRACE_COLORS[(len(self.traces) - 1) % len(TRACE_COLORS)]))
         self.lw_traces.addItem(it)
-        self.tabs.setCurrentIndex(6)
+        self.goto("analyse")
         self.draw_compare()
 
     def remove_trace(self):
@@ -1706,7 +2333,7 @@ class Main(QtWidgets.QMainWindow):
         self.seq.start(self.ed_seq.toPlainText())
 
     def seq_done(self, verdict):
-        col = {"PASS": "#2fbf5f", "FAIL": "#ff5050"}.get(verdict, "#ffb000")
+        col = {"PASS": self.theme_t["pass_"], "FAIL": self.theme_t["fail"]}.get(verdict, self.theme_t["warn"])
         self.lb_verdict.setText(verdict)
         self.lb_verdict.setStyleSheet(f"color:{col};")
         self.add_event("Séquence", None, f"verdict {verdict}")
@@ -1738,7 +2365,7 @@ class Main(QtWidgets.QMainWindow):
                 return
             url = f"http://{WebServer.local_ip()}:{self.sp_webport.value()}/"
             self.lb_web.setText(f'<a href="{url}">{url}</a>')
-            self.web.set(online=bool(self.worker), unit=self.unit(), mode=self.lb_mode.text())
+            self.web.set(online=bool(self.worker), unit=self.unit(), mode=self.mode_text())
             self.sp_webport.setEnabled(False)
         else:
             self.web.stop()
@@ -1757,6 +2384,8 @@ class Main(QtWidgets.QMainWindow):
         d = QtWidgets.QDialog(self)
         d.setWindowTitle("Configuration MQTT")
         fl = QtWidgets.QFormLayout(d)
+        fl.setContentsMargins(20, 20, 20, 20)
+        fl.setVerticalSpacing(10)
         host = QtWidgets.QLineEdit(c["host"])
         port = QtWidgets.QSpinBox(minimum=1, maximum=65535, value=c["port"])
         user = QtWidgets.QLineEdit(c["user"])
@@ -1876,6 +2505,8 @@ class Main(QtWidgets.QMainWindow):
         d = QtWidgets.QDialog(self)
         d.setWindowTitle("Rapport d'intervention")
         fl = QtWidgets.QFormLayout(d)
+        fl.setContentsMargins(20, 20, 20, 20)
+        fl.setVerticalSpacing(10)
         c = self.cfg
         ed = {k: QtWidgets.QLineEdit(c.value(f"rep_{k}", "") if k in ("tech", "company") else "") for k in
               ("company", "client", "device", "ref", "tech")}
@@ -1912,8 +2543,7 @@ class Main(QtWidgets.QMainWindow):
             images["chart.png"] = self._grab(self.plot)
             sections.append(("Graphique", "<img src='chart.png' width='640'>"))
         if on("hist") and self.tbuf:
-            self.tabs.setCurrentIndex(1)
-            self.refresh_views()
+            self._draw_hist(self.view_y if self.view_y.size else np.fromiter(self.ybuf, float))
             images["hist.png"] = self._grab(self.hplot)
             sections.append(("Histogramme", "<img src='hist.png' width='640'>"))
         if on("caps") and self.tbl.rowCount():
@@ -1947,13 +2577,6 @@ class Main(QtWidgets.QMainWindow):
         self.setWindowFlag(Qt.WindowStaysOnTopHint, self.act_top.isChecked())
         self.show()
 
-    def toggle_compact(self):
-        c = self.act_compact.isChecked()
-        for w in (self.left, self.tabs, self.stat_box):
-            w.setVisible(not c)
-        if c:
-            self.resize(700, 280)
-
     def toggle_floating(self):
         if self.act_float.isChecked():
             self.floating = FloatingDisplay()
@@ -1961,7 +2584,7 @@ class Main(QtWidgets.QMainWindow):
             g = self.cfg.value("float_pos")
             if g:
                 self.floating.move(g)
-            self.floating.update_view(self.disp_text, self.lb_mode.text(), "", self.pf)
+            self.floating.update_view(self.disp_text, self.mode_text(), "", self.pf, self.disp_color)
             self.floating.show()
         elif self.floating:
             self.floating.close()
@@ -1971,27 +2594,6 @@ class Main(QtWidgets.QMainWindow):
             self.cfg.setValue("float_pos", self.floating.pos())
         self.floating = None
         self.act_float.setChecked(False)
-
-    def toggle_theme(self):
-        self.theme = "light" if self.act_light.isChecked() else "dark"
-        self.colors = apply_theme(QtWidgets.QApplication.instance(), self.theme)
-        for p in self.plots:
-            p.setBackground(self.colors["plot"])
-            for ax in ("left", "bottom"):
-                p.getAxis(ax).setPen(self.colors["fg"])
-                p.getAxis(ax).setTextPen(self.colors["fg"])
-        self.curve.setPen(pg.mkPen(self.colors["curve"], width=1.5))
-        self.cfg.setValue("theme", self.theme)
-
-    def set_zoom(self, pct, save=True):
-        app = QtWidgets.QApplication.instance()
-        f = app.font()
-        f.setPointSizeF(9 * pct / 100)
-        app.setFont(f)
-        for a in self.zoom_group.actions():
-            a.setChecked(a.data() == pct)
-        if save:
-            self.cfg.setValue("zoom", pct)
 
     def closeEvent(self, ev):
         self._save_settings()
@@ -2012,6 +2614,8 @@ def main():
     app.setApplicationName("XDM1041Studio")
     app.setOrganizationName("Davy")
     app.setWindowIcon(app_icon())
+    app.setStyle("Fusion")
+    TH.load_fonts()
     w = Main()
     w.show()
     sys.exit(app.exec())

@@ -1,0 +1,224 @@
+# -*- coding: utf-8 -*-
+"""Afficheur principal : style Atelier (moderne) ou Instrument (LCD à voyants et barregraphe)."""
+from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6.QtCore import Qt
+from . import theme as TH
+from .theme import mix
+from .ui import BarGraph, mono, ui_font, T
+
+ANNUN = ["AUTO", "HOLD", "REL", "AVG", "MATH", "dB", "2ND", "REC", "RMT"]
+
+
+class DisplayWidget(QtWidgets.QFrame):
+    def __init__(self, parent=None, preview=False):
+        super().__init__(parent)
+        self.setObjectName("Display")
+        self.preview = preview
+        self.skin = "atelier"
+        self.num, self.unit_txt, self.color = "-----", "V", None
+        self.blink_on = True
+        v = QtWidgets.QVBoxLayout(self)
+        v.setContentsMargins(24, 14, 26, 14)
+        v.setSpacing(4)
+
+        top = QtWidgets.QHBoxLayout()
+        top.setSpacing(8)
+        self.chip_box = QtWidgets.QHBoxLayout()
+        self.chip_box.setSpacing(8)
+        self.chips = []
+        self.annun_box = QtWidgets.QHBoxLayout()
+        self.annun_box.setSpacing(16)
+        self.annun = {}
+        for a in ANNUN:
+            lab = QtWidgets.QLabel(a)
+            self.annun[a] = lab
+            self.annun_box.addWidget(lab)
+        self.rate = QtWidgets.QLabel("")
+        top.addLayout(self.chip_box)
+        top.addLayout(self.annun_box)
+        top.addStretch()
+        top.addWidget(self.rate)
+        v.addLayout(top)
+
+        mid = QtWidgets.QHBoxLayout()
+        mid.setSpacing(14)
+        mid.addStretch()
+        self.val = QtWidgets.QLabel("-----")
+        self.val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.val.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+        self.unit = QtWidgets.QLabel("V")
+        self.unit.setAlignment(Qt.AlignLeft | Qt.AlignBottom)
+        mid.addWidget(self.val, 1)
+        mid.addWidget(self.unit, 0, Qt.AlignVCenter)
+        v.addLayout(mid, 1)
+
+        barrow = QtWidgets.QHBoxLayout()
+        barrow.setSpacing(12)
+        self.bar = BarGraph()
+        self.scale = QtWidgets.QLabel("")
+        barrow.addWidget(self.bar, 1)
+        barrow.addWidget(self.scale)
+        self.bar_w = QtWidgets.QWidget(objectName="Transparent")
+        self.bar_w.setLayout(barrow)
+        barrow.setContentsMargins(0, 0, 0, 0)
+        v.addWidget(self.bar_w)
+
+        self.statsline = QtWidgets.QLabel("")
+        v.addWidget(self.statsline)
+
+        bot = QtWidgets.QHBoxLayout()
+        bot.setSpacing(14)
+        self.pf = QtWidgets.QLabel("", objectName="PF")
+        self.extra = QtWidgets.QLabel("", objectName="Muted")
+        self.sec = QtWidgets.QLabel("")
+        bot.addWidget(self.pf)
+        bot.addWidget(self.extra)
+        bot.addStretch()
+        bot.addWidget(self.sec)
+        v.addLayout(bot)
+
+        self.glow = QtWidgets.QGraphicsDropShadowEffect(self.val)
+        self.glow.setOffset(0, 0)
+        self.val.setGraphicsEffect(self.glow)
+        self.blink = QtCore.QTimer(self, interval=450, timeout=self._blink)
+        self.blink.start()
+        self.apply_theme()
+
+    # ---------------------------------------------------------------- thème
+    def apply_theme(self, skin=None):
+        if skin:
+            self.skin = skin
+        t = TH.CURRENT
+        inst = self.skin == "instrument"
+        self.setProperty("skin", self.skin)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        for c in self.chips:
+            c.setVisible(not inst)
+        for a, lab in self.annun.items():
+            lab.setVisible(inst)
+            lab.setFont(mono(14))
+        self.rate.setFont(mono(12))
+        self.rate.setStyleSheet(f"color: {t.get('muted')};")
+        self.bar_w.setVisible(inst or bool(t.get("bargraph")))
+        self.scale.setFont(mono(16))
+        self.scale.setStyleSheet(f"color: {mix(t.get('digit', '#888'), t.get('disp_bg', '#000'), 0.45)};")
+        self.statsline.setVisible(inst)
+        self.statsline.setFont(mono(16))
+        self.statsline.setStyleSheet(f"color: {mix(t.get('digit', '#888'), t.get('disp_bg', '#000'), 0.45)};")
+        self.sec.setFont(mono(20))
+        self.sec.setStyleSheet(f"color: {t.get('sec')};")
+        self.extra.setFont(ui_font(13))
+        g = int(t.get("glow", 40))
+        self.glow.setEnabled(g > 0)
+        c = QtGui.QColor(t.get("digit", "#3ddc84"))
+        c.setAlpha(min(255, int(g * 2.4)))
+        self.glow.setColor(c)
+        self.glow.setBlurRadius(4 + g * 0.45)
+        self._last = None
+        self._paint_value()
+        self._refresh_annun()
+
+    def _refresh_annun(self):
+        for a, lab in self.annun.items():
+            on = lab.property("on")
+            lab.setStyleSheet(f"color: {T('digit') if on else T('annun_off')};")
+
+    # ---------------------------------------------------------------- données
+    def set_value(self, num, unit, color=None):
+        self.num, self.unit_txt, self.color = num, unit, color
+        self._paint_value()
+
+    def _paint_value(self):
+        t = TH.CURRENT
+        col = self.color or t.get("digit", "#3ddc84")
+        if self.num == "OL" and t.get("blink_ol") and not self.blink_on:
+            col = mix(col, t.get("disp_bg", "#000"), 0.75)
+        self.val.setText(self.num)
+        self.unit.setText(self.unit_txt)
+        size = int(self._fit_size())
+        key = (size, col, t.get("digit_font"), self.skin)
+        if key == getattr(self, "_last", None):
+            return
+        self._last = key
+        f = mono(size, "Share Tech" not in t.get("digit_font", ""))
+        self.val.setFont(f)
+        self.unit.setFont(mono(max(14, size * 0.4)))
+        self.val.setStyleSheet(f"color: {col};")
+        self.unit.setStyleSheet(f"color: {col}; padding-top: {int(size * 0.32)}px;")
+
+    def _fit_size(self):
+        want = int(TH.CURRENT.get("digit_size", 128))
+        if self.preview:
+            want = int(want * 0.6)
+        avail_w = max(60, self.width() - 60)
+        avail_h = max(30, self.height() - (150 if self.skin == "instrument" else 110))
+        n = max(5, len(self.num))
+        fm = QtGui.QFontMetricsF(mono(100, True))
+        w100 = fm.horizontalAdvance("8" * n) + 0.4 * fm.horizontalAdvance("8" * max(2, len(self.unit_txt))) + 14
+        fit_w = avail_w / w100 * 100
+        fit_h = avail_h / 0.95
+        return max(18, min(want, fit_w, fit_h))
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._paint_value()
+
+    def _blink(self):
+        if self.num == "OL" and TH.CURRENT.get("blink_ol"):
+            self.blink_on = not self.blink_on
+            self._paint_value()
+        elif not self.blink_on:
+            self.blink_on = True
+            self._paint_value()
+
+    def set_chips(self, items):
+        while len(self.chips) < len(items):
+            c = QtWidgets.QLabel(objectName="DispChip")
+            self.chip_box.addWidget(c)
+            self.chips.append(c)
+        for i, c in enumerate(self.chips):
+            if i < len(items):
+                c.setText(items[i])
+                c.setProperty("accent", i == 0)
+                c.style().unpolish(c)
+                c.style().polish(c)
+                c.setVisible(self.skin != "instrument")
+            else:
+                c.setVisible(False)
+
+    def set_annunciators(self, on):
+        changed = False
+        for a, lab in self.annun.items():
+            v = bool(on.get(a))
+            if lab.property("on") != v:
+                lab.setProperty("on", v)
+                changed = True
+        if changed:
+            self._refresh_annun()
+
+    def set_rate(self, txt):
+        self.rate.setText(txt)
+
+    def set_pf(self, pf):
+        self.pf.setVisible(bool(pf))
+        if pf:
+            self.pf.setText(pf)
+            if self.pf.property("pf") != pf:
+                self.pf.setProperty("pf", pf)
+                self.pf.style().unpolish(self.pf)
+                self.pf.style().polish(self.pf)
+            self.pf.setFont(ui_font(16, QtGui.QFont.Bold))
+
+    def set_extra(self, txt):
+        self.extra.setText(txt)
+
+    def set_secondary(self, txt):
+        self.sec.setText(txt)
+
+    def set_bar(self, frac, scale_txt=""):
+        self.bar.set_fraction(frac if frac is not None else 0.0)
+        self.scale.setText(scale_txt)
+
+    def set_statsline(self, txt):
+        self.statsline.setText(txt)

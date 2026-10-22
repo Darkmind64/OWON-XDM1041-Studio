@@ -2,7 +2,11 @@
 
 Logiciel Windows graphique pour le multimètre de table **OWON XDM1041** (et compatibles SCPI : XDM2041, Victor 8045M…), piloté par le port COM virtuel USB.
 
-![Fenêtre principale](docs/screenshot.png)
+![Style Atelier](docs/screenshot.png)
+
+| Style Instrument | Mode disposition | Apparence |
+|---|---|---|
+| ![](docs/instrument.png) | ![](docs/disposition.png) | ![](docs/apparence.png) |
 
 ## Téléchargement
 
@@ -47,7 +51,14 @@ Windows 10/11 64 bits. Le multimètre apparaît comme un port COM (pilote CH340)
 - **MQTT** avec découverte automatique **Home Assistant**
 - Console SCPI avec historique
 
-**Interface** : thèmes sombre/clair, taille de texte réglable (écrans 4K), raccourcis clavier.
+**Interface (v3)**
+- Deux styles au choix : **Atelier** (moderne, tuiles) ou **Instrument** (face avant, voyants, barregraphe)
+- Navigation par **barre latérale** ou **onglets**
+- **Mode disposition** : panneaux déplaçables/redimensionnables à la souris, détachables (second écran), dispositions prédéfinies et personnalisées
+- **Apparence** : 5 thèmes (Phosphore, Ambre, Glacier, Nixie, Clair), couleurs éditables, police/taille/halo des chiffres, aperçu en direct, import/export
+- Taille de texte réglable (écrans 4K), raccourcis clavier
+- **Mises à jour automatiques** : vérification des releases GitHub au démarrage (désactivable dans Options), notes de version, téléchargement vérifié (SHA-256) et installation en un clic — installateur ou exécutable portable
+
 
 ## Raccourcis
 

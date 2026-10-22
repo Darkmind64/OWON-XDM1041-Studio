@@ -5,7 +5,7 @@ import serial
 from PySide6 import QtCore
 
 APP = "OWON XDM1041 Studio"
-VERSION = "2.0"
+VERSION = "3.0"
 OL_LIMIT = 9.9e8
 
 MODES = {
@@ -52,6 +52,22 @@ def fmt_si(v, unit, sig=6, noprefix=False):
     ax = abs(x)
     intd = 1 if ax < 1 else int(math.floor(math.log10(ax))) + 1
     return f"{x:.{max(0, sig - intd)}f} {p}{unit}"
+
+
+def fmt_parts(v, unit, sig=6, noprefix=False):
+    if v is None:
+        return "-----", unit
+    if not math.isfinite(v):
+        return "OL", unit
+    num, u = fmt_si(v, unit, sig, noprefix).split(" ", 1)
+    return num, u
+
+
+def auto_full_scale(v):
+    a = abs(v)
+    if a <= 0 or not math.isfinite(a):
+        return None
+    return 5 * 10 ** math.ceil(math.log10(a / 5) - 1e-12)
 
 
 def speak_si(v, unit, sig=4, noprefix=False):
